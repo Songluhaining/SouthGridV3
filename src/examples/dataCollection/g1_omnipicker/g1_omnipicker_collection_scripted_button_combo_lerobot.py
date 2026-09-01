@@ -434,8 +434,10 @@ class MonitoredTrajectoryDevice(AbstractDevice):
                 m, d, base_raw, _, _, ee_sid, _ = self.mj_ctx
                 Rb = d.xmat[base_raw].reshape(3, 3)
                 self.ready_actual = Rb.T @ (d.site_xpos[ee_sid] - d.xpos[base_raw])
+                self.base_w0 = d.xpos[base_raw].copy()  # 基座世界位置：用于集末计算基座漂移
             except Exception:
                 self.ready_actual = None
+                self.base_w0 = None
         self.l_arm.update_action_position(self.l_pos[self.t])
         self.l_arm.update_action_axisangle(self.l_quat[self.t])
         self.r_arm.update_action_position(self.r_pos[self.t])
@@ -485,6 +487,10 @@ class MonitoredTrajectoryDevice(AbstractDevice):
                         self.press_obs[i]["inplane_at_min"] = float(np.linalg.norm(off[1:]))
 
         if self.t == len(self.r_pos) - 1:
+            # 按压反作用力会把基座推离电柜：记录本集基座世界位移（场景漂移信号，state 基座系随之漂移）
+            if self.mj_ctx is not None and getattr(self, "base_w0", None) is not None:
+                _, d, base_raw, _, _, _, _ = self.mj_ctx
+                self.base_drift = float(np.linalg.norm(d.xpos[base_raw] - self.base_w0))
             self.task_status.update_task_status(True)
         self.t += 1
 
@@ -536,10 +542,10 @@ def main() -> None:
                         help="连续多少集按压全败即停止（场景漂移信号：按压反作用力会累计推远基座与电柜，需重启仿真）")
     parser.add_argument("--contact_offset", type=str, default="0,0",
                         help="调试/标定用：给所有接触位姿加固定偏移 dy,dz（米），如 -0.008,0")
-    parser.add_argument("--max_site_dist", type=float, default=0.075,
+    parser.add_argument("--max_site_dist", type=float, default=0.080,
                         help="press 模式：按压窗口内 ee_site 到按钮 site 的最小距离(米)须 ≤ 该值，否则整集判废。"
-                             "这是官方计分口径（0.05 内满分，0.057≈9.9 分）。指尖顶按的物理下限约 0.053~0.058，"
-                             "红色因高位姿态误差约 0.067（v3 单按钮集实测），默认 0.075 只剔除明显偏斜的按压；0 关闭")
+                             "这是官方计分口径（0.05 内满分，0.068≈9.5 分，0.077≈9.0 分）。指尖顶按实测约 0.067~0.073，"
+                             "红色偏斜时 0.073~0.076，默认 0.080 只剔除明显偏斜的按压；0 关闭")
     parser.add_argument("--max_cam_gap_s", type=float, default=0.5,
                         help="本集内任一相机相邻两帧接收间隔的最大值(秒)超过该值即判废——相机接收线程被主循环"
                              "挤占会让图像相对 state 滞后。试采实测每集最大间隔常态 0.30~0.36s，v3 数据里最坏约 1s，"
@@ -914,6 +920,7 @@ def main() -> None:
                     "ee_path_len_m": round(float(np.linalg.norm(dr, axis=1).sum()), 3),
                     "mean_jerk": round(float(np.abs(np.diff(dr, n=2, axis=0)).mean()), 8),
                     "cam_max_gap_s": round(float(cam_gap), 3),
+                    "base_drift_m": round(float(getattr(device, "base_drift", float("nan"))), 4),
                 }
 
                 keep = all_success or args.keep_failed
