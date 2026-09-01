@@ -147,11 +147,11 @@ state 左臂通道写常数。
 | 起点 | 固定 | 30 mm | 录制首帧右手离预备位 ≤ 30 mm |
 | 真实按压 | `--press_threshold` | 1 mm | 目标按钮滑动关节位移 |
 | 按错 | 固定 | — | 位移最大的不是目标按钮 |
-| 官方口径距离 | `--max_site_dist` | 0.075 m | 按压窗口内 `ee_center_site_r` 到按钮 site 的最小距离（官方计分口径） |
+| 官方口径距离 | `--max_site_dist` | 0.080 m | 按压窗口内 `ee_center_site_r` 到按钮 site 的最小距离（官方计分口径） |
 | 相机帧间隔 | `--max_cam_gap_s` | 0.5 s | 本集内任一相机相邻两帧接收间隔的最大值（试采常态 0.30～0.36 s；明显大于此值说明图像相对 state 滞后） |
 
-`quality.jsonl` 每次按压记录 `max_disp_m`（压深）、`min_cap_dist_m`、`min_site_dist_m`（官方口径）、`inplane_at_min_m`
-（最近点处的面内偏移），每集记录 `metrics.cam_max_gap_s`。
+`quality.jsonl` 每次按压记录 `max_disp_m`（压深）、`min_cap_dist_m`、`min_site_dist_m`（官方口径，实时基座系）、`inplane_at_min_m`
+（最近点处的面内偏移），每集记录 `metrics.cam_max_gap_s` 与 `metrics.base_drift_m`（按压反作用力造成的基座世界位移）。
 
 关于官方口径的实测结论（v3 数据 1005 集 + `probe_press_geometry.py` 仿真探测）：官方每钮得分只取决于 ee_site 到按钮 site
 的最小距离（0.05 m 内满分，0.057 m≈9.9 分）；按钮 site 随帽一起滑动，**压得更深不会更近**；指尖在 ee_site 前方约 5 cm，
