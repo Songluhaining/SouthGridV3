@@ -176,6 +176,25 @@ def _parse_gripper_token(val, prev: float, g_open: float, g_close: float) -> flo
     return float(s)
 
 
+def align_quat(q_xyzw, frac: float):
+    """把姿态 q 的 x 轴（夹爪轴线）向 base 系 +x（柜面法向）扶正 frac 比例（绕叉积轴的最小旋转）。
+
+    按钮任务用：指尖在 ee_center_site 前方约 5cm，夹爪轴线相对柜面法向倾斜时，指尖对准帽心
+    会让 ee_center_site 产生面内偏移，直接拉大官方计分距离。返回 xyzw。
+    """
+    q = np.asarray(q_xyzw, dtype=np.float64)
+    if frac <= 0:
+        return q
+    Rq = R.from_quat(q)
+    ax = Rq.as_matrix()[:, 0]
+    axis = np.cross(ax, np.array([1.0, 0.0, 0.0]))
+    s_ = float(np.linalg.norm(axis))
+    if s_ < 1e-6:
+        return q
+    ang = float(np.arctan2(s_, float(ax[0])))
+    return (R.from_rotvec(axis / s_ * ang * float(frac)) * Rq).as_quat()
+
+
 def build_segmented_trajectory(
     env,
     agent_conf,
