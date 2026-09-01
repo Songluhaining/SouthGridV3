@@ -1067,8 +1067,15 @@ class G1OmniPickerLeRobotStorage(LeRobotSimSyncMixin, G1OmniPickerDataStorage):
     底盘 /action/drive/ctrl 不写入 LeRobot 数据集（仅用于遥操作时移动机器人）。
     """
 
-    def __init__(self, dataset_path: str) -> None:
+    def __init__(self, dataset_path: str, lock_left: bool = False) -> None:
+        """lock_left=True：左臂通道（位姿 0:7、左爪 14:16）写死为首帧常数。
+
+        配合左臂关节 PD 锁定使用：实际位姿恒定，写常数进一步消除数值噪声，
+        使模型学到"左臂不动"而非复现残余抖动。采集与推理必须一致。
+        """
         super().__init__(dataset_path=dataset_path, hdf5_path=None)
+        self._lock_left = lock_left
+        self._left_lock_vals: tuple[np.ndarray, np.ndarray] | None = None
 
         from conf import g1_omnipicker_conf
         n_l = len(g1_omnipicker_conf.gripper_l["actuator_names"])
@@ -1101,11 +1108,16 @@ class G1OmniPickerLeRobotStorage(LeRobotSimSyncMixin, G1OmniPickerDataStorage):
         r_range = self._r_grip_max - self._r_grip_min
         l_norm = np.clip((l_motor - self._l_grip_min) / np.where(l_range > 0, l_range, 1.0), 0.0, 1.0)
         r_norm = np.clip((r_motor - self._r_grip_min) / np.where(r_range > 0, r_range, 1.0), 0.0, 1.0)
-        return np.concatenate([
+        state = np.concatenate([
             pos[0], quat[0],
             pos[1], quat[1],
             l_norm, r_norm,
         ]).astype(np.float32)
+        if self._lock_left:
+            if self._left_lock_vals is None:
+                self._left_lock_vals = (state[0:7].copy(), state[14:16].copy())
+            state[0:7], state[14:16] = self._left_lock_vals
+        return state
 
 
 # ---------------------------------------------------------------------------

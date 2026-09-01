@@ -28,6 +28,9 @@ SouthGrid 客户端通过标准 WebSocket 接口连接策略服务。无需将 S
 
 ## 启动策略服务
 
+> 按钮任务 checkpoint（配置名 `pi05_g1_button_lora`）依赖本仓库 `openpi_patches/g1_button/` 中的 openpi 定制（策略变换 + 训练配置补丁）；在新机器上起服务前先按该目录的 README 打补丁。checkpoint 目录自带 `assets/` 归一化统计，推理不需要基座权重。
+
+
 请使用与交付任务匹配的 OpenPI 策略配置和 checkpoint。在 OpenPI 环境中启动服务：
 
 ```bash

@@ -1,0 +1,112 @@
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..916aeb9 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
+ import openpi.policies.aloha_policy as aloha_policy
+ import openpi.policies.droid_policy as droid_policy
+ import openpi.policies.libero_policy as libero_policy
++import openpi.policies.g1_button_policy as g1_button_policy
+ import openpi.shared.download as _download
+ import openpi.shared.normalize as _normalize
+ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+@@ -355,6 +356,39 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+         )
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotG1ButtonDataConfig(DataConfigFactory):
++    """SouthGrid G1 OmniPicker 按钮任务（LeRobot v2.1，18 维绝对位姿动作，双相机）。"""
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/image": "observation.images.cam_head",
++                        "observation/wrist_image": "observation.images.cam_wrist_r",
++                        "observation/state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++        data_transforms = _transforms.Group(
++            inputs=[g1_button_policy.G1ButtonInputs(model_type=model_config.model_type)],
++            outputs=[g1_button_policy.G1ButtonOutputs()],
++        )
++        # 数据集中 action[i] = state[i+1]（绝对位姿），不做 delta 变换。
++        model_transforms = ModelTransformFactory()(model_config)
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++        )
++
++
+ @dataclasses.dataclass(frozen=True)
+ class RLDSDroidDataConfig(DataConfigFactory):
+     """
+@@ -933,6 +967,47 @@ _CONFIGS = [
+     #
+     # Debugging configs.
+     #
++    #
++    # SouthGrid G1 OmniPicker 四色按钮任务：pi0.5 + LoRA 微调。
++    # 冻结策略：PaliGemma 主干与动作专家的基座权重全部冻结，仅训练注入的 LoRA
++    # 适配层（get_freeze_filter 自动生成过滤器）。适配 24GB 单卡显存。
++    #
++    TrainConfig(
++        name="pi05_g1_button_lora",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotG1ButtonDataConfig(
++            repo_id="local/g1_omnipicker_button_combo",
++            base_config=DataConfig(
++                prompt_from_task=True,
++                action_sequence_keys=("action",),
++            ),
++        ),
++        batch_size=32,
++        fsdp_devices=2,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=30_000,
++            decay_lr=5e-6,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        num_train_steps=30_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++    ),
+     TrainConfig(
+         name="debug",
+         data=FakeDataConfig(),
+diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
+index e2ee7dd..cbf92bc 100644
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -143,6 +143,7 @@ def create_torch_dataset(
+         delta_timestamps={
+             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+         },
++        video_backend="pyav",
+     )
+ 
+     if data_config.prompt_from_task:

@@ -2,15 +2,15 @@
     "version": "3.0",
     "viewport_camera_transform": {
         "position": [
-            18.959060668945312,
-            -24.213773727416992,
-            2.787480592727661
+            16.951086044311523,
+            -24.482240676879883,
+            0.9313704371452332
         ],
         "rotation": [
-            0.9538427417785791,
-            -0.30029260565873633,
-            0.0008690736564085571,
-            -0.0027603720743913044
+            0.9696099377787102,
+            -0.03046881287975467,
+            0.007624410725060878,
+            -0.24263158978904553
         ]
     },
     "actors": [
@@ -420,13 +420,18 @@
                                     "type": "bool"
                                 },
                                 {
+                                    "name": "IsRecording",
+                                    "value": true,
+                                    "type": "bool"
+                                },
+                                {
                                     "name": "ColorPort",
-                                    "value": 7080,
+                                    "value": 7090,
                                     "type": "int"
                                 },
                                 {
                                     "name": "DepthPort",
-                                    "value": 7081,
+                                    "value": 7091,
                                     "type": "int"
                                 },
                                 {
@@ -623,6 +628,21 @@
                                     "name": "UseNvEnc",
                                     "value": true,
                                     "type": "bool"
+                                },
+                                {
+                                    "name": "IsRecording",
+                                    "value": true,
+                                    "type": "bool"
+                                },
+                                {
+                                    "name": "ColorPort",
+                                    "value": 7080,
+                                    "type": "int"
+                                },
+                                {
+                                    "name": "DepthPort",
+                                    "value": 7081,
+                                    "type": "int"
                                 },
                                 {
                                     "name": "Enable",

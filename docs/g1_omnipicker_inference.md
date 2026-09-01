@@ -17,7 +17,7 @@
 
 ┌──────────────────────────────────────────┐
 │  eval 推理脚本（orcalab_lerobot Conda 环境）│
-│  eval_g1_omnipicker_lerobot.py           │
+│  eval_g1_omnipicker_button_lerobot.py    │
 │  连接 OrcaLab 仿真 + 策略服务器           │
 └──────────────────────────────────────────┘
 ```
@@ -60,19 +60,31 @@ uv run scripts/serve_policy.py \
 
 ### 2. 运行 eval 脚本
 
+**按钮任务请通过包装脚本运行**（每个评测进程之前冷重启 OrcaLab）：
+
+```bash
+cd src/examples/inference/g1_omnipicker
+bash run_button_eval.sh --prompt "按红色按钮" --episodes 1 \
+    --team_id <team_id> --team_token <token>   # 官方评分参数按需追加
+```
+
+原因（实测）：同一个 OrcaLab 实例上第二个连接进来的客户端，起点前导段推不到 L 型预备位姿（OrcaLab 导出给本地 MuJoCo 的模型把导出瞬间的手臂姿态烘焙进连杆坐标系，关节角语义与限位随之平移），策略随即输出失真；采集包装脚本也是因此每块冷重启。包装脚本调用 `dataCollection/g1_omnipicker/orcalab_restart.sh`（无头启动 + 开仿真 + 相机准备），机器相关路径可用环境变量覆盖（见脚本头部）。
+
+官方评分看的是 `ee_site` 到按钮 site 的最小距离（0.05 m 内满分、逐帧回溯取最优），而本地判定的提前结束条件是机器人几何体到按钮帽 ≤ `--success_dist`（默认 45 mm）；正式评分建议加 `--no_early_stop`，让策略跑满 `max_steps` 以免在临界距离处过早结束。
+
+按钮任务 eval 会自动复现采集时的起始条件，保证观测分布与训练数据一致：每集先按关节角瞬移粗定位，再按采集前导段的方式（150 步插值 + 150 步保持）把右手驶向 L 型预备位姿（`conf/g1_omnipicker_conf.py` 的 `r_arm_ready`）并闭合右爪、左臂关节 PD 锁定（策略输出的左臂通道被忽略、state 左臂通道写常数），并在连接相机前通过 OrcaLab MCP 把腕相机 `camera_right` 转到 (90,180,0)、重建 `IsRecording`（与采集包装脚本共用 `dataCollection/g1_omnipicker/orcalab_camera_prep.sh`）。因此 OrcaLab 的 MCP 服务（默认 `http://127.0.0.1:12345/mcp`）需要可达；若已手动设置相机，可加 `--no_camera_prep`。
+
 请在运行本项目的主机上打开另一个终端，从仓库根目录进入推理脚本所在目录。本地推理时，请将 `--host` 设为 `localhost`（该参数的默认值即为 `localhost`）：
 
 **按钮任务：**
 
 ```bash
 cd src/examples/inference/g1_omnipicker
-python eval_g1_omnipicker_lerobot.py \
+python eval_g1_omnipicker_button_lerobot.py \
     --task_config ../../dataCollection/common/example.yaml \
     --host localhost \
     --port 8010 \
     --prompt "按红色按钮" \
-    --max_steps 500 \
-    --action_repeat 1 \
     --episodes 3
 ```
 
@@ -127,13 +139,11 @@ uv run scripts/serve_policy.py \
 
 ```bash
 cd src/examples/inference/g1_omnipicker
-python eval_g1_omnipicker_lerobot.py \
+python eval_g1_omnipicker_button_lerobot.py \
     --task_config ../../dataCollection/common/example.yaml \
     --host <server_ip_or_hostname> \
     --port 8010 \
     --prompt "按红色按钮" \
-    --max_steps 500 \
-    --action_repeat 1 \
     --episodes 3
 ```
 
@@ -161,10 +171,16 @@ python eval_g1_omnipicker_tool_lerobot.py \
 | `--host` | 策略服务器主机（本地填 `localhost`，远程填 IP 或主机名） | `localhost` |
 | `--port` | 策略服务器 WebSocket 端口 | `8010` |
 | `--prompt` | 任务语言指令，须与训练数据中的描述完全一致 | 按钮任务为 `按红色按钮`，工具任务为 `整理工具` |
-| `--max_steps` | 每集最大控制步数 | 按钮 500，工具 10000 |
-| `--action_repeat` | 每个动作块重复执行次数 | `1` |
+| `--max_steps` | 每集最大控制步数（按钮任务 5 ms/步，目标全部按下会提前结束） | 按钮 6000，工具 10000 |
+| `--action_repeat` | 每个推理 action 重复执行的控制步数。按钮任务训练数据 20 fps、控制 200 Hz，必须为 `10`，否则轨迹被压缩 10 倍、手几乎不动 | 按钮 `10`，工具 `1` |
 | `--episodes` | 评估集数 | `1` |
 | `--camera_warmup_steps` | 每集推理前相机预热步数 | `10` |
+| `--prompts` | 按钮任务：同一集（同一 attempt）内依次执行的多条指令，每条之间先回到预备位姿；给出时忽略 `--prompt`，`--max_steps` 变为每条指令的步数预算。配合 `--success_dist 0` 可让每条指令在真实压下后立即切换下一条 | 未启用 |
+| `--start_pose` | 按钮任务：`ready`（默认）复现 v3 采集的 L 型预备位姿前导段；`neutral` 沿用场景默认位姿，用于评估以默认位姿起步采集的旧模型 | `ready` |
+| `--ready_move_steps` | 按钮任务：每集开始前右手按采集前导段的方式插值驶向 L 型预备位姿的步数 | `150` |
+| `--settle_steps` | 按钮任务：到达预备位姿后钉住目标等 OSC 收敛的步数（不计入 `max_steps`） | `150` |
+| `--no_camera_prep` | 按钮任务：跳过经 MCP 设置腕相机朝向 (90,180,0) 与重建 IsRecording | 未启用（默认自动执行） |
+| `--mcp_url` | 按钮任务：OrcaLab MCP 地址（相机准备用） | `http://127.0.0.1:12345/mcp` |
 | `--sleep` | 按实时步长节奏运行 | 未启用 |
 | `--no_images` | 跳过相机采图，发送空图 | 未启用 |
 | `--no_preview` | 按钮任务：不显示相机实时预览小窗口 | 未启用（按钮任务默认显示预览） |
