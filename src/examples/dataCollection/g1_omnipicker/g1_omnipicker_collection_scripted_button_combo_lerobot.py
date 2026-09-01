@@ -400,7 +400,7 @@ class MonitoredTrajectoryDevice(AbstractDevice):
         self.env = env
         self.button_joints = list(button_joints)
         self.windows = windows
-        # mj_ctx: (mjModel, mjData, base_raw_id, robot_geom_ids, window_cap_gids)
+        # mj_ctx: (mjModel, mjData, base_raw_id, robot_geom_ids, window_cap_gids, ee_site_id, window_site_ids)
         self.mj_ctx = mj_ctx
         self.l_arm, self.r_arm = l_arm, r_arm
         self.l_grip, self.r_grip = l_grip, r_grip
@@ -415,7 +415,7 @@ class MonitoredTrajectoryDevice(AbstractDevice):
         # 每个窗口的监测结果
         self.press_obs = [
             {"max_disp": {j: 0.0 for j in self.button_joints}, "first_cross": {},
-             "min_cap_dist": float("inf")}
+             "min_cap_dist": float("inf"), "min_site_dist": float("inf"), "inplane_at_min": None}
             for _ in windows
         ]
 
@@ -431,11 +431,9 @@ class MonitoredTrajectoryDevice(AbstractDevice):
             self.task_status.update_task_status(True)
             # 记录录制首帧时的实际右手位置（B 系），供集末做起点质量判定
             try:
-                m, d, base_raw, _, _ = self.mj_ctx
-                site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE,
-                                         self.env.site("ee_center_site_r"))
+                m, d, base_raw, _, _, ee_sid, _ = self.mj_ctx
                 Rb = d.xmat[base_raw].reshape(3, 3)
-                self.ready_actual = Rb.T @ (d.site_xpos[site] - d.xpos[base_raw])
+                self.ready_actual = Rb.T @ (d.site_xpos[ee_sid] - d.xpos[base_raw])
             except Exception:
                 self.ready_actual = None
         self.l_arm.update_action_position(self.l_pos[self.t])
@@ -468,15 +466,23 @@ class MonitoredTrajectoryDevice(AbstractDevice):
                         rec["first_cross"][j] = self.t
 
         if active and self.t % self.SAMPLE_EVERY == 0 and self.mj_ctx is not None:
-            m, d, base_raw, robot_geoms, win_caps = self.mj_ctx
+            m, d, base_raw, robot_geoms, win_caps, ee_sid, win_sites = self.mj_ctx
             pb = d.xpos[base_raw]
             Rb = d.xmat[base_raw].reshape(3, 3)
             robot_pts = np.array([Rb.T @ (d.geom_xpos[g] - pb) for g in robot_geoms])
+            ee_B = Rb.T @ (d.site_xpos[ee_sid] - pb)
             for i in active:
                 cap = Rb.T @ (d.geom_xpos[win_caps[i]] - pb)
                 dist = float(np.linalg.norm(robot_pts - cap[None, :], axis=1).min())
                 if dist < self.press_obs[i]["min_cap_dist"]:
                     self.press_obs[i]["min_cap_dist"] = dist
+                # 官方计分口径：ee_site 到按钮 site（site 随帽滑动）的最小距离及此时的面内偏移
+                if win_sites[i] is not None:
+                    off = ee_B - Rb.T @ (d.site_xpos[win_sites[i]] - pb)
+                    sd = float(np.linalg.norm(off))
+                    if sd < self.press_obs[i]["min_site_dist"]:
+                        self.press_obs[i]["min_site_dist"] = sd
+                        self.press_obs[i]["inplane_at_min"] = float(np.linalg.norm(off[1:]))
 
         if self.t == len(self.r_pos) - 1:
             self.task_status.update_task_status(True)
@@ -530,6 +536,14 @@ def main() -> None:
                         help="连续多少集按压全败即停止（场景漂移信号：按压反作用力会累计推远基座与电柜，需重启仿真）")
     parser.add_argument("--contact_offset", type=str, default="0,0",
                         help="调试/标定用：给所有接触位姿加固定偏移 dy,dz（米），如 -0.008,0")
+    parser.add_argument("--max_site_dist", type=float, default=0.075,
+                        help="press 模式：按压窗口内 ee_site 到按钮 site 的最小距离(米)须 ≤ 该值，否则整集判废。"
+                             "这是官方计分口径（0.05 内满分，0.057≈9.9 分）。指尖顶按的物理下限约 0.053~0.058，"
+                             "红色因高位姿态误差约 0.067（v3 单按钮集实测），默认 0.075 只剔除明显偏斜的按压；0 关闭")
+    parser.add_argument("--max_cam_gap_s", type=float, default=0.5,
+                        help="本集内任一相机相邻两帧接收间隔的最大值(秒)超过该值即判废——相机接收线程被主循环"
+                             "挤占会让图像相对 state 滞后。试采实测每集最大间隔常态 0.30~0.36s，v3 数据里最坏约 1s，"
+                             "默认 0.5 只剔除明显滞后的集；0 关闭")
     parser.add_argument("--keep_failed", action="store_true",
                         help="保留按压失败的集（默认丢弃，均在 quality.jsonl 记录）")
     parser.add_argument("--no_recenter", action="store_true",
@@ -674,6 +688,17 @@ def main() -> None:
         if "g1_omnipicker" in (mujoco.mj_id2name(_mj_m, mujoco.mjtObj.mjOBJ_BODY,
                                                  int(_mj_m.geom_bodyid[g])) or "")
     ]
+    # 官方计分口径所需 site：右手 ee_center_site 与各颜色按钮 site（与评分服务同名）
+    _ee_sid = mujoco.mj_name2id(_mj_m, mujoco.mjtObj.mjOBJ_SITE, env.site(agent_conf.r_arm["ee_site_name"]))
+    _site_names = [mujoco.mj_id2name(_mj_m, mujoco.mjtObj.mjOBJ_SITE, i) or "" for i in range(_mj_m.nsite)]
+    # 场景里关节名与 site 名的大小写不一致（Button03_joint vs button03_site），按小写匹配
+    color2site = {
+        c: next((i for i, n in enumerate(_site_names)
+                 if n.lower().endswith(f"electricalcabinet_{color2joint[c].split('_')[-2].lower()}_site")), None)
+        for c in color2joint
+    }
+    if any(v is None for v in color2site.values()):
+        orca_logger.warning(f"[标定] 按钮 site 缺失: {color2site}，官方口径闸门将不生效")
 
     # 双臂 OSC + 双夹爪控制器。做成可重建：控制器在创建时绑定 model 对象，
     # 场景异步 publish 会替换 model，持有过期引用的 OSC 表现为 ~10 倍跟踪迟滞
@@ -807,7 +832,8 @@ def main() -> None:
                     env, button_joints, windows,
                     l_arm, r_arm, l_grip, r_grip, task_status,
                     l_pos, l_quat, r_pos, r_quat_traj, l_gm, r_gm,
-                    mj_ctx=(_mj_m, _mj_d, _base_raw, _robot_geom_ids, win_caps),
+                    mj_ctx=(_mj_m, _mj_d, _base_raw, _robot_geom_ids, win_caps, _ee_sid,
+                            [color2site[w["color"]] for w in windows]),
                     pre_roll=pre_roll)
                 manager.set_device(device)
                 # 防御：位标志会被任何 model 重载冲掉（竞态随机出现），每集强制重设并验证。
@@ -816,7 +842,10 @@ def main() -> None:
                 _dis = int(env.gym._mjModel.opt.disableactuator)
                 if not (_dis >> agent_conf.positions_group) & 1:
                     orca_logger.warning(f"[防御] positions 禁用位设置失败: {_dis:#x}")
+                _t_ep0 = time.time()
                 manager.run_episode()
+                cam_gap = max((cam.max_gap_since(_t_ep0) for cam in cameras.values()
+                               if hasattr(cam, "max_gap_since")), default=0.0)
 
                 # ── 质量评估 ────────────────────────────────────────────────
                 if device.n_query_errors:
@@ -839,11 +868,18 @@ def main() -> None:
                     target_disp = disp.get(target_joint, 0.0)
                     pressed_joint = max(disp, key=disp.get) if disp else None
                     min_dist = obs_rec.get("min_cap_dist", float("inf"))
+                    min_site = obs_rec.get("min_site_dist", float("inf"))
                     if args.success_mode == "proximity":
                         success = (min_dist <= args.proximity_threshold
                                    or target_disp >= args.press_threshold)
                     else:
                         success = target_disp >= args.press_threshold
+                        if args.max_site_dist > 0 and min_site != float("inf") and min_site > args.max_site_dist:
+                            success = False
+                            orca_logger.warning(
+                                f"[官方口径] {w['color']} ee_site 最小距离 {min_site*1000:.0f}mm"
+                                f" > {args.max_site_dist*1000:.0f}mm（面内偏移 "
+                                f"{(obs_rec.get('inplane_at_min') or 0)*1000:.0f}mm），本集判废")
                     wrong_button = (
                         pressed_joint != target_joint
                         and disp.get(pressed_joint, 0.0) >= args.press_threshold
@@ -858,6 +894,9 @@ def main() -> None:
                         "pressed_joint": pressed_joint.split("_")[-2] if pressed_joint else None,
                         "max_disp_m": round(target_disp, 5),
                         "min_cap_dist_m": round(min_dist, 4) if min_dist != float("inf") else None,
+                        "min_site_dist_m": round(min_site, 4) if min_site != float("inf") else None,
+                        "inplane_at_min_m": (round(obs_rec["inplane_at_min"], 4)
+                                             if obs_rec.get("inplane_at_min") is not None else None),
                         "success": bool(success),
                         "wrong_button": bool(wrong_button),
                         "press_time_s": round((press_t - w["t0"]) * ctrl_dt, 3) if press_t is not None else None,
@@ -865,12 +904,16 @@ def main() -> None:
                     })
                     all_success = all_success and success and not wrong_button
 
+                if args.max_cam_gap_s > 0 and cam_gap > args.max_cam_gap_s:
+                    all_success = False
+                    orca_logger.warning(f"[相机] 最大帧间隔 {cam_gap:.2f}s > {args.max_cam_gap_s:.2f}s，图像滞后，本集判废")
                 dr = np.diff(np.asarray(r_pos, dtype=np.float64), axis=0)
                 metrics = {
                     "duration_steps": int(len(r_pos)),
                     "duration_s": round(len(r_pos) * ctrl_dt, 2),
                     "ee_path_len_m": round(float(np.linalg.norm(dr, axis=1).sum()), 3),
                     "mean_jerk": round(float(np.abs(np.diff(dr, n=2, axis=0)).mean()), 8),
+                    "cam_max_gap_s": round(float(cam_gap), 3),
                 }
 
                 keep = all_success or args.keep_failed

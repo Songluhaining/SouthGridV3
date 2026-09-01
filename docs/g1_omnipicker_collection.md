@@ -124,6 +124,40 @@ python g1_omnipicker_collection_scripted_button_lerobot.py \
 
 接近、前推、保压、后撤等分段步数见文末「高级调参参数」。
 
+### 多按钮组合采集（v3/v4 数据流程）
+
+多按钮组合数据（单条指令按 1～4 个按钮、多样化措辞）用 `g1_omnipicker_collection_scripted_button_combo_lerobot.py`，
+并且**必须经包装脚本运行**：
+
+```bash
+bash run_button_combo_collection.sh ~/datasets/g1_button_combo_v4 1000 25 \
+    --trajectory_archive button_traj_archive_v2.json --elite_top_frac 0.25 \
+    --length_weights 1.5,1.2,1.1,1.2 --max_consec_fail 10 --success_mode press
+```
+
+包装脚本每块（第 3 个参数，默认 10 集）冷重启一次 OrcaLab（`orcalab_restart.sh`：无头启动、开仿真、腕相机置位），
+原因见该脚本头部注释：同一实例上第二个连接的进程关节角语义会漂移。每集流程：瞬移到 L 型预备位形 →
+150 步插值 + 150 步保持驶向 `conf.r_arm_ready`（录制从此开始）→ 按指令顺序接近/前推/保压/回撤。左臂关节 PD 锁定，
+state 左臂通道写常数。
+
+逐集质量闸门（任一不过即整集丢弃，均记入 `meta/quality.jsonl`）：
+
+| 闸门 | 参数 | 默认 | 含义 |
+|------|------|------|------|
+| 起点 | 固定 | 30 mm | 录制首帧右手离预备位 ≤ 30 mm |
+| 真实按压 | `--press_threshold` | 1 mm | 目标按钮滑动关节位移 |
+| 按错 | 固定 | — | 位移最大的不是目标按钮 |
+| 官方口径距离 | `--max_site_dist` | 0.075 m | 按压窗口内 `ee_center_site_r` 到按钮 site 的最小距离（官方计分口径） |
+| 相机帧间隔 | `--max_cam_gap_s` | 0.5 s | 本集内任一相机相邻两帧接收间隔的最大值（试采常态 0.30～0.36 s；明显大于此值说明图像相对 state 滞后） |
+
+`quality.jsonl` 每次按压记录 `max_disp_m`（压深）、`min_cap_dist_m`、`min_site_dist_m`（官方口径）、`inplane_at_min_m`
+（最近点处的面内偏移），每集记录 `metrics.cam_max_gap_s`。
+
+关于官方口径的实测结论（v3 数据 1005 集 + `probe_press_geometry.py` 仿真探测）：官方每钮得分只取决于 ee_site 到按钮 site
+的最小距离（0.05 m 内满分，0.057 m≈9.9 分）；按钮 site 随帽一起滑动，**压得更深不会更近**；指尖在 ee_site 前方约 5 cm，
+指尖顶按的下限是 53～58 mm（红色因高位姿态误差约 67 mm）。夹爪轴线放平、倾斜偏移、向法向扶正、接近点残差补偿都试过、
+均无收益（OSC 在柜面前达不到那些姿态）。`probe_press_geometry.py` 保留这些模式供继续调参，运行前需冷重启 OrcaLab。
+
 ---
 
 ## Pico 遥操作采集

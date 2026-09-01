@@ -5,6 +5,8 @@ maps, live-frame capture, resolution detection, and timestamp-aligned MP4 frame
 iteration. A camera map has the form
 ``{environment_camera_name: (dataset_key, port), ...}``.
 """
+import collections
+import io
 import logging
 import os
 import socket
@@ -92,6 +94,64 @@ def wait_ports_open(
     return ready
 
 
+class TimestampedCameraWrapper:
+    """在 orca_gym CameraWrapper 基础上记录每帧解码完成的墙钟时间，用于检测图像滞后。
+
+    背景（v3 数据实测）：接收线程被 200Hz 主循环挤占 GIL 时，帧在 socket 里积压、随后成批解码，
+    "最新帧"实际是旧的；相邻两帧接收间隔的最大值可直接反映这种积压。
+    延迟构造：orca_gym 依赖较重，只在 bring_up_cameras 内导入并生成子类。
+    """
+
+    _cls = None
+
+    @classmethod
+    def make(cls, name: str, port: int):
+        if cls._cls is None:
+            from orca_gym.sensor.rgbd_camera import CameraWrapper  # type: ignore[import]
+            import av  # type: ignore[import]
+            import websockets  # type: ignore[import]
+
+            class _Wrapper(CameraWrapper):
+                def __init__(self, name: str, port: int):
+                    super().__init__(name=name, port=port)
+                    self.recv_times: collections.deque = collections.deque(maxlen=20000)
+
+                async def do_stuff(self):
+                    # 与 CameraWrapper.do_stuff 相同的接收/解码循环，只多记 recv_times
+                    uri = f"ws://localhost:{self.port}"
+                    async with websockets.connect(uri) as websocket:
+                        cur_pos = 0
+                        raw = io.BytesIO()
+                        container = None
+                        while self.running:
+                            data = await websocket.recv()
+                            data = data[8:]
+                            raw.write(data)
+                            raw.seek(cur_pos)
+                            if cur_pos == 0:
+                                container = av.open(raw, mode="r")
+                            for packet in container.demux():
+                                if packet.size == 0:
+                                    continue
+                                for frame in packet.decode():
+                                    self.image = frame.to_ndarray(format="bgr24")
+                                    self.image_index += 1
+                                    self.recv_times.append(time.time())
+                                    if not self.received_first_frame:
+                                        self.received_first_frame = True
+                            cur_pos += len(data)
+
+                def max_gap_since(self, t0: float) -> float:
+                    """t0 之后相邻两帧接收间隔的最大值（秒）；不足两帧返回 0。"""
+                    ts = [t for t in self.recv_times if t >= t0]
+                    if len(ts) < 2:
+                        return 0.0
+                    return float(max(b - a for a, b in zip(ts[:-1], ts[1:])))
+
+            cls._cls = _Wrapper
+        return cls._cls(name=name, port=port)
+
+
 def bring_up_cameras(
     camera_map: dict,
     port_timeout: float = 30.0,
@@ -110,15 +170,13 @@ def bring_up_cameras(
     Returns:
         {env_name: CameraWrapper}，仅包含已收到首帧的相机。
     """
-    from orca_gym.sensor.rgbd_camera import CameraWrapper  # type: ignore[import]
-
     ready = wait_ports_open(camera_map, timeout=port_timeout)
     if not ready:
         return {}
 
     cameras: dict = {}
     for name, port in ready.items():
-        cam = CameraWrapper(name=name, port=port)
+        cam = TimestampedCameraWrapper.make(name=name, port=port)
         cam.start()
         cameras[name] = cam
         print(f"  ✓ 相机 {name} 已连接（端口 {port}）", flush=True)
@@ -140,7 +198,7 @@ def bring_up_cameras(
                     "相机 %s 后台线程已退出，重启（第 %d/%d 次）",
                     name, restarts[name], max_restart,
                 )
-                cam = CameraWrapper(name=name, port=ready[name])
+                cam = TimestampedCameraWrapper.make(name=name, port=ready[name])
                 cam.start()
                 cameras[name] = cam
         print(f"  等待首帧: {pending}", flush=True)
