@@ -420,7 +420,8 @@ def hold_target(manager, env, device, action: dict, steps: int, sleep_s: float =
 READY_R_GRIP_CTRL = 2.0
 
 
-def drive_to_ready(manager, env, device, start: dict, move_steps: int, hold_steps: int) -> dict:
+def drive_to_ready(manager, env, device, start: dict, move_steps: int, hold_steps: int,
+                   left_pose: tuple | None = None) -> dict:
     """复现采集前导段：右手从当前位姿按位置线性 / 姿态 slerp 插值驶向 L 型预备位姿并闭合右爪，
     再钉住目标等 OSC 收敛。阶跃目标会让 OSC 走到另一条路上卡住（实测停在 129mm 外），
     必须与采集一样平滑插值。返回最终目标 action。
@@ -430,10 +431,18 @@ def drive_to_ready(manager, env, device, start: dict, move_steps: int, hold_step
     p0 = np.asarray(start["r_pos_b"], dtype=np.float32)
     slerp = Slerp([0.0, 1.0], R.from_quat([start["r_quat_b"], ready_quat]))
     target = dict(start, r_grip_ctrl=np.array([READY_R_GRIP_CTRL] * 2, dtype=np.float32))
+    if left_pose is not None:
+        # 同步把左臂驶向数据集的左臂锁定位姿（左臂此时须为 OSC，见 build_controllers(left_osc=True)）
+        lp0 = np.asarray(start["l_pos_b"], dtype=np.float32)
+        l_pos1 = np.asarray(left_pose[:3], dtype=np.float32)
+        l_slerp = Slerp([0.0, 1.0], R.from_quat([start["l_quat_b"], np.asarray(left_pose[3:7])]))
     for i in range(max(1, move_steps)):
         a = (i + 1) / max(1, move_steps)
         target["r_pos_b"] = p0 + (ready_pos - p0) * a
         target["r_quat_b"] = slerp(a).as_quat().astype(np.float32)
+        if left_pose is not None:
+            target["l_pos_b"] = lp0 + (l_pos1 - lp0) * a
+            target["l_quat_b"] = l_slerp(a).as_quat().astype(np.float32)
         hold_target(manager, env, device, target, 1)
     target["r_pos_b"], target["r_quat_b"] = ready_pos, ready_quat
     hold_target(manager, env, device, target, hold_steps)
@@ -468,14 +477,20 @@ def create_gripper(env, grip_conf):
     )
 
 
-def build_controllers(manager, env):
+def build_controllers(manager, env, left_osc: bool = False):
     """每集重建控制器（env.reset() 重载模型，关节锁缓存的原生索引会失效）。
 
-    左臂用关节 PD 锁定（与采集一致，策略输出的左臂通道被忽略），右臂 OSC。
+    左臂默认关节 PD 锁定（与采集一致，策略输出的左臂通道被忽略），右臂 OSC。
+    left_osc=True 时左臂先用 OSC（供 --left_pose 前导段驱动，之后调 lock_left_arm 换成关节锁）。
     """
     ctrl_l = [env.actuator(n) for n in agent_conf.l_arm["motors_names"]]
     ctrl_r = [env.actuator(n) for n in agent_conf.r_arm["motors_names"]]
-    l_arm = JointLockController(env, agent_conf.l_arm, ctrl_l)
+    if left_osc:
+        l_arm = create_arm_osc_controller(
+            env, agent_conf.l_arm, agent_conf.base_body, ctrl_l,
+            dict(zip(ctrl_l, agent_conf.l_arm["motors_init_ctrl"])))
+    else:
+        l_arm = JointLockController(env, agent_conf.l_arm, ctrl_l)
     r_arm = create_arm_osc_controller(
         env, agent_conf.r_arm, agent_conf.base_body, ctrl_r,
         dict(zip(ctrl_r, agent_conf.r_arm["motors_init_ctrl"])))
@@ -485,6 +500,17 @@ def build_controllers(manager, env):
     for c in (l_arm, r_arm, l_grip, r_grip):
         manager.add_controller(c)
     return l_arm, r_arm, l_grip, r_grip
+
+
+def lock_left_arm(manager, env, device):
+    """把左臂当前位姿交给关节锁（替换 manager 里的左臂 OSC），此后策略的左臂输出被忽略。"""
+    ctrl_l = [env.actuator(n) for n in agent_conf.l_arm["motors_names"]]
+    lock = JointLockController(env, agent_conf.l_arm, ctrl_l)
+    lock.init_ctrl_index()
+    lock.reset()
+    manager.controllers[0] = lock
+    device.l_arm = lock
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +539,10 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="评估集数")
     parser.add_argument("--camera_warmup_steps", type=int, default=10,
                         help="每集推理前相机预热步数（默认 10）")
+    parser.add_argument("--left_pose", type=str, default="",
+                        help="左臂锁定位姿 x,y,z,qx,qy,qz,qw（base 系，四元数 xyzw）。"
+                             "训练数据的左臂不在本机中立位时必须传（例如 g1_button_local_v4 模型："
+                             "0.699,0.079,0.231,-0.674,0.310,-0.231,0.629）；前导段用 OSC 驶到该位姿后再锁定")
     parser.add_argument("--start_pose", choices=("ready", "neutral"), default="ready",
                         help="起点：ready=复现 v3 采集的 L 型预备位姿前导段；neutral=沿用场景默认位姿"
                              "（评估 v2 及更早、以默认位姿起步采集的模型时使用）")
@@ -554,6 +584,9 @@ def main():
         help="可选启用左腕相机 camera_wrist_l_color:7070（默认关闭）",
     )
     args = parser.parse_args()
+    args._left_pose = tuple(float(x) for x in args.left_pose.split(",")) if args.left_pose else None
+    if args._left_pose is not None and len(args._left_pose) != 7:
+        parser.error("--left_pose 需要 7 个数：x,y,z,qx,qy,qz,qw")
 
     if args.max_steps < 1:
         parser.error("--max_steps must be >= 1")
@@ -649,7 +682,8 @@ def main():
             # 与采集一致：瞬移到 L 型预备位形，再重建控制器（左臂关节锁以当前位形为目标）
             if args.start_pose == "ready":
                 teleport_to_ready(env)
-            l_arm, r_arm, l_grip, r_grip = build_controllers(manager, env)
+            l_arm, r_arm, l_grip, r_grip = build_controllers(
+                manager, env, left_osc=args._left_pose is not None)
             manager.set_init_ctrl()
             env.set_ctrl(manager.ctrl)
             env.mj_forward()
@@ -727,7 +761,14 @@ def main():
             # 随后以稳定后的实测位姿作为策略的初始末端目标。
             if args.start_pose == "ready":
                 _ready_apply = drive_to_ready(manager, env, device, _init_action_apply,
-                                              args.ready_move_steps, args.settle_steps)
+                                              args.ready_move_steps, args.settle_steps,
+                                              left_pose=args._left_pose)
+                if args._left_pose is not None:
+                    l_arm = lock_left_arm(manager, env, device)
+                    _l_err = float(np.linalg.norm(
+                        storage.build_state(storage.obs_callback(env))[0:3]
+                        - np.asarray(args._left_pose[:3], dtype=np.float32)))
+                    orca_logger.info(f"左臂已驶至锁定位姿并锁定，位置误差 {_l_err * 1000:.0f}mm")
                 _start_state = storage.build_state(storage.obs_callback(env))
                 _start_err = float(np.linalg.norm(_start_state[7:10] - _ready_apply["r_pos_b"]))
                 _start_ang = float(np.degrees((R.from_quat(_start_state[10:14])

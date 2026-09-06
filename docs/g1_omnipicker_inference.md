@@ -176,6 +176,7 @@ python eval_g1_omnipicker_tool_lerobot.py \
 | `--episodes` | 评估集数 | `1` |
 | `--camera_warmup_steps` | 每集推理前相机预热步数 | `10` |
 | `--prompts` | 按钮任务：同一集（同一 attempt）内依次执行的多条指令，每条之间先回到预备位姿；给出时忽略 `--prompt`，`--max_steps` 变为每条指令的步数预算。配合 `--success_dist 0` 可让每条指令在真实压下后立即切换下一条 | 未启用 |
+| `--left_pose` | 按钮任务：左臂锁定位姿 `x,y,z,qx,qy,qz,qw`（base 系，xyzw）。训练数据的左臂不在本机中立位时必须传；前导段用 OSC 把左臂驶到该位姿后再交给关节锁 | 空（左臂锁在中立位） |
 | `--start_pose` | 按钮任务：`ready`（默认）复现 v3 采集的 L 型预备位姿前导段；`neutral` 沿用场景默认位姿，用于评估以默认位姿起步采集的旧模型 | `ready` |
 | `--ready_move_steps` | 按钮任务：每集开始前右手按采集前导段的方式插值驶向 L 型预备位姿的步数 | `150` |
 | `--settle_steps` | 按钮任务：到达预备位姿后钉住目标等 OSC 收敛的步数（不计入 `max_steps`） | `150` |
