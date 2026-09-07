@@ -87,7 +87,10 @@ def main() -> None:
         (line for line in cv2.getBuildInformation().splitlines() if "GUI:" in line),
         "",
     )
-    if "QT5" not in gui_line:
+    # The eval preview needs an OpenCV build with a window backend. The Linux wheel
+    # ships QT5 and the Windows wheel ships WIN32UI; cv2.imshow behaves the same.
+    accepted_gui = ("WIN32UI",) if sys.platform == "win32" else ("QT5",)
+    if not any(backend in gui_line for backend in accepted_gui):
         raise RuntimeError(f"OpenCV GUI build required for eval preview, got: {gui_line!r}")
 
     # Verify the complete camera-pipeline import chain.

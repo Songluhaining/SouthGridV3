@@ -1,0 +1,25 @@
+# SouthGrid 运行环境（Windows x64）。请从新环境创建，不要更新已有环境。
+#
+# 与 environment-unitree.yml 的差别（版本 pin 完全一致，只调整来源与 build 号）：
+#
+#   1. 全部 conda 包统一取自 conda-forge。在 win-64 上混用 defaults 与 conda-forge
+#      会得到一个坏环境：defaults 的 python 需要 libffi-8.dll，而 conda-forge 的
+#      libffi 不提供该 DLL，装完后 _ctypes 无法加载（ctypes / scipy 全部 import 失败）。
+#
+#   2. NumPy 和 SciPy 不由 conda 提供，改用 PyPI 版本（见 install_runtime_windows.ps1）。
+#      原因：conda-forge 的 numpy/scipy 链接 LLVM 的 libomp.dll，而 PyPI 的 torch 自带
+#      Intel 的 libiomp5md.dll，两套 OpenMP 运行时在同一进程里冲突，表现为
+#        OMP: Error #15: Initializing libomp.dll, but found libiomp5md.dll already initialized
+#      随后 Fatal Python error: Aborted（若 torch 后导入则是 0xc0000139，进程直接消失、
+#      没有任何 Python 异常）。PyPI 的 numpy/scipy 自带 OpenBLAS，不加载 libomp.dll，
+#      与 torch 的 Intel OpenMP 互不干扰。Linux 的动态链接容忍这种共存，Windows 不容忍。
+#
+#   3. Python build 号：Linux 为 h4d16e0c_1，conda-forge win-64 对应 hb12b558_1_cpython。
+
+name: orcalab_lerobot
+channels:
+  - conda-forge
+dependencies:
+  # 以下版本已通过完整运行验证。
+  - python=3.12.13=hb12b558_1_cpython
+  - pip=26.0.1

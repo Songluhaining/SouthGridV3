@@ -673,7 +673,7 @@ def encoder_worker_main(
         tb = traceback.format_exc()
         _log.error(f"[ENC-PROC] 子进程异常退出: {e}\n{tb}")
         try:
-            Path("/tmp/enc_child_crash.txt").write_text(tb)
+            Path(tempfile.gettempdir(), "enc_child_crash.txt").write_text(tb)
         except Exception:
             pass
         try:

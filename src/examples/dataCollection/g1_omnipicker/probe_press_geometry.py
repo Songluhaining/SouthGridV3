@@ -28,6 +28,7 @@ import mujoco  # noqa: E402
 import eval_g1_omnipicker_button_lerobot as ev  # noqa: E402
 from conf import g1_omnipicker_conf as agent_conf  # noqa: E402
 from dataCollectionManager.data_collection_manager import DataCollectionManager  # noqa: E402
+from dataStorage.lerobot_camera import scratch_dir  # noqa: E402
 from dataStorage.lerobot_data_storage import G1OmniPickerLeRobotStorage  # noqa: E402
 from scene.scene_manager import SceneManager  # noqa: E402
 from task.abstract_task import EmptyTask  # noqa: E402
@@ -77,7 +78,7 @@ def main():
     g_close = float(cand.get("gripper_close", 2.0))
 
     sm = SceneManager("localhost:50051", config=cfg)
-    storage = G1OmniPickerLeRobotStorage(dataset_path="/tmp/_probe_scratch", lock_left=True)
+    storage = G1OmniPickerLeRobotStorage(dataset_path=scratch_dir("_probe_scratch"), lock_left=True)
 
     def obs_safe(env):
         if env.model.nu == 0:

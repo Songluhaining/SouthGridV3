@@ -10,6 +10,8 @@ import io
 import logging
 import os
 import socket
+import sys
+import tempfile
 import time
 
 import cv2
@@ -27,6 +29,40 @@ WRIST_L_CAMERA = {
     "camera_wrist_l_color": ("cam_wrist_l", 7070),
 }
 DEFAULT_HW = (480, 640)
+
+# ---------------------------------------------------------------------------
+# 本机临时工作目录（推流触发目录、storage 草稿目录）
+# ---------------------------------------------------------------------------
+
+# Windows 默认的临时工作根目录。该目录同时由 OrcaStudio 服务端写入录像，
+# 因此放在数据盘而不是系统盘。盘符不存在时回退到系统临时目录。
+_WINDOWS_SCRATCH_ROOT = r"G:\southgrid\_scratch"
+
+
+def scratch_root() -> str:
+    r"""返回本机临时工作根目录。
+
+    Linux 为 ``/tmp``；Windows 为 ``G:\southgrid\_scratch``（G 盘不存在时回退到
+    系统临时目录）。环境变量 ``ORCA_SCRATCH_ROOT`` 可覆盖上述默认值。
+    """
+    override = os.environ.get("ORCA_SCRATCH_ROOT")
+    if override:
+        return override
+    if sys.platform != "win32":
+        return "/tmp"
+    drive = os.path.splitdrive(_WINDOWS_SCRATCH_ROOT)[0] + os.sep
+    if os.path.isdir(drive):
+        return _WINDOWS_SCRATCH_ROOT
+    return os.path.join(tempfile.gettempdir(), "orca_scratch")
+
+
+def scratch_dir(name: str) -> str:
+    """返回临时工作根目录下名为 ``name`` 的子目录路径（不创建目录）。
+
+    用于相机推流触发目录（OrcaStudio 在其中建 ``video/`` 子目录写录像）
+    以及 storage 的草稿目录。
+    """
+    return os.path.join(scratch_root(), name)
 
 
 def omnipicker_camera_map(*, enable_wrist_l: bool = False) -> dict:

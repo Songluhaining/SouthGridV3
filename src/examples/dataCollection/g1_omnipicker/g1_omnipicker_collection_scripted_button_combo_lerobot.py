@@ -8,6 +8,12 @@
      路径长度等指标写入 <lerobot_out>/meta/quality.jsonl，供后续筛选/加权微调使用；
   4. 默认丢弃任何一次按压失败的集（--keep_failed 保留并在 quality.jsonl 标注）。
 """
+# torch 必须在本进程的任何其它原生库之前加载。Windows 实测：在已经建立仿真连接、
+# 加载过 MuJoCo 模型的进程里首次导入 torch，会触发 Windows fatal exception
+# 0xc0000139（DLL 入口点找不到），进程直接退出，没有 Python 异常也没有 traceback。
+# lerobot 本就依赖 torch，这里只是把导入时机提到最前面。
+import torch  # noqa: F401  isort:skip
+
 import argparse
 import itertools
 import json
@@ -17,6 +23,7 @@ import random
 import sys
 import time
 from datetime import datetime
+from typing import NamedTuple
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if project_root not in sys.path:
@@ -50,6 +57,7 @@ from dataStorage.lerobot_camera import (
     bring_up_cameras,
     close_cameras,
     probe_camera_hw,
+    scratch_dir,
 )
 from dataStorage.lerobot_data_storage import G1OmniPickerLeRobotStorage, LeRobotDatasetWriter
 from devices.abstract_device import AbstractDevice
@@ -62,7 +70,7 @@ BUTTON_CAMERA_MAP = {
     "camera_wrist_r_color": ("cam_wrist_r", 7080),
 }
 ENTRY_POINT = "envs.dataCollection.dataCollection_env:DataCollectionEnv"
-STREAM_TRIGGER_PATH = "/tmp/g1_scripted_button_combo_lerobot_stream"
+STREAM_TRIGGER_PATH = scratch_dir("g1_scripted_button_combo_lerobot_stream")
 
 log_dir = os.path.join(base_dir, "logs")
 orca_logger = get_orca_logger(
@@ -228,17 +236,104 @@ class DiversityBins:
         return best
 
 
+# ---------------------------------------------------------------------------
+# 官方计分口径（解码自 orca_scorer_client 26.8.26.1）
+# ---------------------------------------------------------------------------
+# 判定量：g1_omnipicker_ee_center_site_r 到目标按钮 site 的欧氏距离。
+# 评分服务以 10Hz 后台采样，attempt 结束时回溯所有帧、取得分最高的一帧。
+#   configs/tasks.yaml           得分曲线（抛物线，顶点 0.05m）与颜色→site 映射
+#   orca_competition/conditions.py  抛物线插值与噪声
+#   scorer_service/engine.py     最佳帧回溯、P1 最近按钮惩罚、P2 速通惩罚
+OFFICIAL_PEAK_M = 0.05        # 抛物线顶点：距离 0.05m 得满分，0m 与 0.10m 均只有 6 分
+OFFICIAL_A = 160.0            # ratio = 1 - A*(d-peak)^2，由 (0,0.6)(0.05,1.0)(0.10,0.6) 定出
+OFFICIAL_KNEE_M = 0.10        # 抛物线段终点，其后二次衰减
+OFFICIAL_TAIL_M = 0.30        # 0.30m 及以外得 0 分
+OFFICIAL_KNEE_RATIO = 0.60
+OFFICIAL_STEP_SCORE = 10.0    # 每个按钮步满分
+OFFICIAL_P1_DISCOUNT = 0.35   # 最佳帧上目标不是最近按钮 → 该步 ×0.35
+OFFICIAL_P2_RADIUS = 0.10     # 四钮均进入该半径才可能触发速通惩罚
+OFFICIAL_P2_SPAN_S = 20.0     # 四钮最佳帧跨度 ≤ 20s → 全部 ×0.6
+OFFICIAL_P2_FAST_S = 5.0      # 跨度 ≤ 5s → 全部 ×0.4
+OFFICIAL_P2_DISCOUNT = 0.6
+OFFICIAL_P2_FAST_DISCOUNT = 0.4
+OFFICIAL_NOISE_AMP = 0.03     # 仅在 d > 0.05m 时施加，故瞄准点取在顶点近侧更稳
+
+
+def official_ratio(dist_m: float) -> float:
+    """官方 score_curve 的得分比率（0~1）。dist_m 为 ee_site 到按钮 site 的距离（米）。
+
+    不含官方那项确定性噪声：噪声只在 d > 0.05m 时施加（幅度 ±0.03），
+    瞄准点取在顶点近侧即可完全避开，因此这里按无噪声的下界估分。
+    """
+    d = float(dist_m)
+    if d <= OFFICIAL_KNEE_M:
+        return max(0.0, 1.0 - OFFICIAL_A * (d - OFFICIAL_PEAK_M) ** 2)
+    if d >= OFFICIAL_TAIL_M:
+        return 0.0
+    t = (OFFICIAL_TAIL_M - d) / (OFFICIAL_TAIL_M - OFFICIAL_KNEE_M)
+    return OFFICIAL_KNEE_RATIO * t * t
+
+
+def apply_p2_discount(best_times_s: list[float], best_dists_m: list[float]) -> tuple[float, str]:
+    """按官方规则计算 P2 速通折扣。返回 (折扣系数, 原因)；不触发时返回 (1.0, "")。
+
+    仅在一次尝试凑满 4 个按钮、且四钮最佳帧距离均 ≤ 0.10m 时才可能触发。
+    """
+    if len(best_times_s) < 4:
+        return 1.0, ""
+    if any(d > OFFICIAL_P2_RADIUS + 1e-6 for d in best_dists_m):
+        return 1.0, ""
+    span = max(best_times_s) - min(best_times_s)
+    if span <= OFFICIAL_P2_FAST_S:
+        return OFFICIAL_P2_FAST_DISCOUNT, f"四钮最佳帧跨度 {span:.1f}s ≤ {OFFICIAL_P2_FAST_S:.0f}s"
+    if span <= OFFICIAL_P2_SPAN_S:
+        return OFFICIAL_P2_DISCOUNT, f"四钮最佳帧跨度 {span:.1f}s ≤ {OFFICIAL_P2_SPAN_S:.0f}s"
+    return 1.0, ""
+
+
+def apply_mode_defaults(args):
+    """按 success_mode 补齐未显式指定的节奏与瞄准参数（main 与离线测试共用）。
+
+    official 模式的节奏由 P2 速通惩罚倒推：四钮最佳帧跨度必须 > 20s，三个间隔
+    即每钮 > 6.7s。最佳帧在窗口内的位置随抖动浮动，实测 8.0s/钮 时相邻间隔会低到
+    6.64s（四钮仅 19.9s，刚好踩线），故放宽到 9.5s/钮（1900 控制步 x 5ms），
+    最坏间隔仍有 8s 以上，四钮跨度约 24～28s。
+    """
+    args._contact_dy, args._contact_dz = (float(x) for x in args.contact_offset.split(","))
+    if args.press_depth is None:
+        # official：瞄准点即目标，不再压入（压入不加分，只会把基座推离电柜）
+        args.press_depth = {"proximity": 0.010, "press": 0.040}.get(args.success_mode, 0.0)
+    if args.steps_approach is None:
+        args.steps_approach = 700 if args.success_mode == "official" else 250
+    if args.steps_retract is None:
+        args.steps_retract = 600 if args.success_mode == "official" else 150
+    if args.steps_push is None:
+        args.steps_push = {"official": 250, "proximity": 120}.get(args.success_mode, 400)
+    if args.steps_hold is None:
+        args.steps_hold = {"official": 350, "proximity": 40}.get(args.success_mode, 200)
+    return args
+
+
 # 右臂 L 型预备位形（定义见 conf.g1_omnipicker_conf.r_arm_ready；推理脚本同源）
 READY_R_ARM_Q = agent_conf.r_arm_ready["joint_values"]
 READY_R_POS_B = np.array(agent_conf.r_arm_ready["ee_pos_b"], dtype=np.float64)
 READY_R_QUAT_B = np.array(agent_conf.r_arm_ready["ee_quat_b"], dtype=np.float64)  # xyzw
 READY_STEPS = 150  # 每集起点由瞬移直接设定，此段仅作稳定（不录制）
 
+# 左爪保持值：按钮任务左臂不参与，左爪应停在初始位形而不是被指令张开
+LEFT_GRIP_HOLD = float(agent_conf.gripper_l["init_ctrl"][0])
+
+# 左臂锁定增益。纯 PD 压不住这条臂（实测 kp=150 漂 18.3°，kp=800 反而 37.4°，
+# 因为力矩已撞驱动器限幅），故改用 hard_lock 运动学锁定，PD 只保留重力前馈。
+LEFT_LOCK_KP = 150.0
+LEFT_LOCK_KD = 10.0
+
 
 def build_combo_segments(
     seq_colors: tuple[str, ...],
     buttons: dict,
     cap_provider,
+    site_provider,
     r_start: np.ndarray,
     approach_back_base: float,
     g_close: float,
@@ -262,10 +357,12 @@ def build_combo_segments(
     t = 0
 
     # v2 前导段：从当前位置走到 ready 预备位姿（此段不录制，见 pre_roll）
+    # 左爪显式钉在 conf 的 init_ctrl：build_segmented_trajectory 的夹爪初值是 g_open，
+    # 而本任务左爪全程 "hold"，不显式给值就会被一路指令张开（实测左爪转了 29°）。
     segments.append({
         "steps": READY_STEPS, "l_hold": True,
         "r_target_b": READY_R_POS_B.tolist(), "r_quat_b": READY_R_QUAT_B.tolist(),
-        "gripper_l": "hold", "gripper_r": g_close,
+        "gripper_l": LEFT_GRIP_HOLD, "gripper_r": g_close,
     })
     # 收敛保持段：目标钉在 ready，等 OSC 稳态后再开始正式轨迹
     segments.append({
@@ -297,6 +394,16 @@ def build_combo_segments(
             r_target = np.asarray(btn["candidates"][cand_idx]["r_target_b"], dtype=np.float64) + d_yz
             r_target[1] += args._contact_dy
             r_target[2] += args._contact_dz
+        elif args.success_mode == "official":
+            # 官方口径：瞄准点取在按钮 site 前方 target_site_dist 处，使 ee_site 到
+            # 按钮 site 的距离落在得分抛物线顶点（0.05m）的近侧无噪声区。
+            # 面内抖动 dy/dz 会拉长欧氏距离，所以沿法向解出 dx 把总距离钉回目标值。
+            site_b = np.asarray(site_provider(color), dtype=np.float64)
+            dy = float(d_yz[1] + args._contact_dy)
+            dz = float(d_yz[2] + args._contact_dz)
+            want = float(args.target_site_dist)
+            dx = math.sqrt(max(1e-6, want * want - dy * dy - dz * dz))
+            r_target = site_b + np.array([-dx, dy, dz])
         if jit > 0:
             r_quat = _jitter_quat_xyzw(r_quat, rng, max_deg=3.0 * jit)
         elite = None
@@ -312,9 +419,18 @@ def build_combo_segments(
         approach = r_target.copy()
         approach[0] -= approach_back
 
+        if args.success_mode == "official":
+            # 节奏由 P2 速通惩罚倒推：四钮最佳帧跨度必须 > 20s，因此时长缩放只允许
+            # 拉长不允许压缩（TSCALE 下界 0.75 会把 8.0s/钮 压到 6.0s，跨度掉到 18s）。
+            ts = max(1.0, ts)
+            # 保压段同样不能用固定的 25~55 步：官方以 10Hz 采样，0.13s 的保压只够采到
+            # 1~3 帧，很可能整个错过最佳距离。改为按 steps_hold 做 ±15% 抖动。
+            n_hold = (int(args.steps_hold * rng.uniform(0.85, 1.15)) if jit > 0
+                      else args.steps_hold)
+        else:
+            n_hold = rng.randint(25, 55) if jit > 0 else args.steps_hold
         n_appr = max(30, int(args.steps_approach * ts))
         n_push = max(30, int(args.steps_push * ts))
-        n_hold = rng.randint(25, 55) if jit > 0 else args.steps_hold
         n_retr = max(30, int(args.steps_retract * ts))
 
         if elite is not None:
@@ -348,6 +464,8 @@ def build_combo_segments(
                 t += n_seg
         push_start = t
         press_pt = r_target.copy()
+        # official 模式 press_depth 为 0：目标就是瞄准点本身，不再压入帽面。
+        # 压入既不加分（按钮 site 随帽滑动，距离不变），又会把基座推离电柜。
         press_pt[0] += max(0.0, args.press_depth)
         segments.append({
             "steps": n_push, "l_hold": True,
@@ -357,14 +475,20 @@ def build_combo_segments(
         t += n_push
         segments.append({"steps": n_hold, "l_hold": True, "r_hold": True, "gripper_r": g_close})
         t += n_hold
+        # 后撤点：official 模式沿法向退到 retract_back 之外再横移到下一个按钮。
+        # 贴着柜面平移会让途经按钮在错误时刻刷出高分帧，触发 P1 最近按钮惩罚。
+        retreat = r_target.copy()
+        retreat[0] -= (float(args.retract_back) if args.success_mode == "official"
+                       else approach_back)
         segments.append({
             "steps": n_retr, "l_hold": True,
-            "r_target_b": approach.tolist(), "r_quat_b": r_quat,
+            "r_target_b": retreat.tolist(), "r_quat_b": r_quat,
             "gripper_r": g_close,
         })
         t += n_retr
 
-        windows.append({"color": color, "t0": push_start, "t1": t})
+        windows.append({"color": color, "t0": push_start, "t1": t,
+                        "aim_b": r_target.tolist()})
         params.append({
             "color": color, "cand_idx": cand_idx,
             "cap_B": cap.round(4).tolist(),
@@ -377,7 +501,7 @@ def build_combo_segments(
             "time_scale": round(ts, 3),
             "steps": [n_appr, n_push, n_hold, n_retr],
         })
-        cursor = approach
+        cursor = retreat
 
     return segments, windows, params, pre_roll
 
@@ -385,6 +509,22 @@ def build_combo_segments(
 # ---------------------------------------------------------------------------
 # 带按钮位移监测的轨迹设备
 # ---------------------------------------------------------------------------
+
+class MjCtx(NamedTuple):
+    """设备层监测用的原生 MuJoCo 句柄。
+
+    用具名字段而非位置元组：这些句柄曾以 7 元组传递，后来新增「全部按钮 site」
+    一项时漏改了其中两处解包，ValueError 被 except 吞掉，表现为起点闸门恒为 inf、
+    基座漂移采不到数据，且没有任何报错。
+    """
+    model: object                 # mjModel
+    data: object                  # mjData
+    base_raw_id: int              # 基座 body 的原生 id
+    robot_geom_ids: list          # 机器人所有 geom（算最近距离用）
+    window_cap_gids: list         # 每个按压窗口对应的帽 geom
+    ee_site_id: int               # 右手 ee_center_site
+    window_site_ids: list         # 每个窗口对应的按钮 site
+    all_button_site_ids: dict     # {颜色: site_id}，P1 自检用
 
 class MonitoredTrajectoryDevice(AbstractDevice):
     """按预计算轨迹驱动双臂/双夹爪，并在按压窗口内采样按钮关节位移。"""
@@ -394,13 +534,20 @@ class MonitoredTrajectoryDevice(AbstractDevice):
     def __init__(self, env, button_joints, windows,
                  l_arm, r_arm, l_grip, r_grip, task_status,
                  l_pos, l_quat, r_pos, r_quat, l_gm, r_gm,
-                 mj_ctx=None, pre_roll=0):
+                 mj_ctx=None, pre_roll=0, lock_joints=None):
         super().__init__()
+        # 额外做运动学锁定的关节（左爪）。左爪是欠驱动连杆：被驱动的是 joint2，
+        # 而 conf 里观测的是 joint1，position 执行器给定 ctrl 后 joint1 会从模型
+        # 默认位形滑到该 ctrl 的平衡位形（实测 12°）。左爪不参与按钮任务，钉住即可。
+        self._lock_joints = list(lock_joints or [])
+        self._lock_qpos = None
         self.pre_roll = int(pre_roll)
         self.env = env
         self.button_joints = list(button_joints)
         self.windows = windows
-        # mj_ctx: (mjModel, mjData, base_raw_id, robot_geom_ids, window_cap_gids, ee_site_id, window_site_ids)
+        # mj_ctx: (mjModel, mjData, base_raw_id, robot_geom_ids, window_cap_gids,
+        #          ee_site_id, window_site_ids, all_button_site_ids)
+        #          最后一项是 {颜色: site_id}，用于官方 P1「目标必须是最近按钮」自检
         self.mj_ctx = mj_ctx
         self.l_arm, self.r_arm = l_arm, r_arm
         self.l_grip, self.r_grip = l_grip, r_grip
@@ -415,7 +562,13 @@ class MonitoredTrajectoryDevice(AbstractDevice):
         # 每个窗口的监测结果
         self.press_obs = [
             {"max_disp": {j: 0.0 for j in self.button_joints}, "first_cross": {},
-             "min_cap_dist": float("inf"), "min_site_dist": float("inf"), "inplane_at_min": None}
+             "min_cap_dist": float("inf"), "min_site_dist": float("inf"), "inplane_at_min": None,
+             # 官方口径：按得分曲线挑最佳帧（不是最近帧——顶点在 0.05m，过近同样掉分）
+             "best_ratio": 0.0, "best_dist": None, "best_t": None,
+             "best_p1_ok": None, "best_nearest": None,
+             # OSC 跟踪残差：末端离本窗口瞄准点最近时的距离。用于区分
+             # 「瞄准点算错」与「末端没走到瞄准点」——两者都会让官方距离偏大。
+             "min_aim_dist": float("inf")}
             for _ in windows
         ]
 
@@ -427,13 +580,21 @@ class MonitoredTrajectoryDevice(AbstractDevice):
     def update(self):
         if self.t >= len(self.r_pos):
             return
+        if self._lock_joints:
+            if self._lock_qpos is None:
+                qp = self.env.query_joint_qpos(self._lock_joints)
+                self._lock_qpos = {j: np.ravel(qp[j]).astype(np.float64).copy()
+                                   for j in self._lock_joints}
+            self.env.set_joint_qpos(self._lock_qpos)
+            self.env.set_joint_qvel({j: np.zeros(1) for j in self._lock_joints})
         if self.t == self.pre_roll:
             self.task_status.update_task_status(True)
             # 记录录制首帧时的实际右手位置（B 系），供集末做起点质量判定
             try:
-                m, d, base_raw, _, _, ee_sid, _ = self.mj_ctx
+                ctx = self.mj_ctx
+                d, base_raw = ctx.data, ctx.base_raw_id
                 Rb = d.xmat[base_raw].reshape(3, 3)
-                self.ready_actual = Rb.T @ (d.site_xpos[ee_sid] - d.xpos[base_raw])
+                self.ready_actual = Rb.T @ (d.site_xpos[ctx.ee_site_id] - d.xpos[base_raw])
                 self.base_w0 = d.xpos[base_raw].copy()  # 基座世界位置：用于集末计算基座漂移
             except Exception:
                 self.ready_actual = None
@@ -468,7 +629,10 @@ class MonitoredTrajectoryDevice(AbstractDevice):
                         rec["first_cross"][j] = self.t
 
         if active and self.t % self.SAMPLE_EVERY == 0 and self.mj_ctx is not None:
-            m, d, base_raw, robot_geoms, win_caps, ee_sid, win_sites = self.mj_ctx
+            ctx = self.mj_ctx
+            d, base_raw = ctx.data, ctx.base_raw_id
+            robot_geoms, win_caps = ctx.robot_geom_ids, ctx.window_cap_gids
+            ee_sid, win_sites, all_sites = ctx.ee_site_id, ctx.window_site_ids, ctx.all_button_site_ids
             pb = d.xpos[base_raw]
             Rb = d.xmat[base_raw].reshape(3, 3)
             robot_pts = np.array([Rb.T @ (d.geom_xpos[g] - pb) for g in robot_geoms])
@@ -478,19 +642,42 @@ class MonitoredTrajectoryDevice(AbstractDevice):
                 dist = float(np.linalg.norm(robot_pts - cap[None, :], axis=1).min())
                 if dist < self.press_obs[i]["min_cap_dist"]:
                     self.press_obs[i]["min_cap_dist"] = dist
-                # 官方计分口径：ee_site 到按钮 site（site 随帽滑动）的最小距离及此时的面内偏移
+                # 官方计分口径：ee_site 到按钮 site（site 随帽滑动）的距离
                 if win_sites[i] is not None:
                     off = ee_B - Rb.T @ (d.site_xpos[win_sites[i]] - pb)
                     sd = float(np.linalg.norm(off))
-                    if sd < self.press_obs[i]["min_site_dist"]:
-                        self.press_obs[i]["min_site_dist"] = sd
-                        self.press_obs[i]["inplane_at_min"] = float(np.linalg.norm(off[1:]))
+                    rec_i = self.press_obs[i]
+                    aim = self.windows[i].get("aim_b")
+                    if aim is not None:
+                        ad = float(np.linalg.norm(ee_B - np.asarray(aim)))
+                        if ad < rec_i["min_aim_dist"]:
+                            rec_i["min_aim_dist"] = ad
+                    if sd < rec_i["min_site_dist"]:
+                        rec_i["min_site_dist"] = sd
+                        rec_i["inplane_at_min"] = float(np.linalg.norm(off[1:]))
+                    # 复刻评分服务的最佳帧回溯：逐帧按得分曲线取比率最高的一帧，
+                    # 并在该帧上做 P1 自检（目标按钮必须是离末端最近的按钮）。
+                    ratio = official_ratio(sd)
+                    if ratio > rec_i["best_ratio"]:
+                        rec_i["best_ratio"] = ratio
+                        rec_i["best_dist"] = sd
+                        rec_i["best_t"] = self.t
+                        ee_w = d.site_xpos[ee_sid]
+                        dists = {c: float(np.linalg.norm(ee_w - d.site_xpos[sid]))
+                                 for c, sid in all_sites.items() if sid is not None}
+                        if dists:
+                            nearest = min(dists, key=dists.get)
+                            tgt = self.windows[i]["color"]
+                            rec_i["best_nearest"] = nearest
+                            rec_i["best_p1_ok"] = bool(
+                                dists.get(tgt, float("inf")) <= min(dists.values()) + 1e-6)
 
         if self.t == len(self.r_pos) - 1:
             # 按压反作用力会把基座推离电柜：记录本集基座世界位移（场景漂移信号，state 基座系随之漂移）
             if self.mj_ctx is not None and getattr(self, "base_w0", None) is not None:
-                _, d, base_raw, _, _, _, _ = self.mj_ctx
-                self.base_drift = float(np.linalg.norm(d.xpos[base_raw] - self.base_w0))
+                ctx = self.mj_ctx
+                self.base_drift = float(
+                    np.linalg.norm(ctx.data.xpos[ctx.base_raw_id] - self.base_w0))
             self.task_status.update_task_status(True)
         self.t += 1
 
@@ -527,9 +714,26 @@ def main() -> None:
                         help="轨迹随机化总强度，0 关闭全部随机化，1 为默认强度")
     parser.add_argument("--canonical_ratio", type=float, default=0.34,
                         help="使用规范表达（与既有数据一致）的概率")
-    parser.add_argument("--success_mode", choices=("proximity", "press"), default="proximity",
-                        help="成功判定：proximity=指尖接近按钮帽（比赛确认的标准，默认）；"
-                             "press=按钮关节真实位移（物理按下）")
+    parser.add_argument("--success_mode", choices=("proximity", "press", "official"),
+                        default="official",
+                        help="瞄准与判定口径：official=复刻官方评分（瞄准按钮 site 前方 "
+                             "target_site_dist，按得分曲线逐帧取最佳帧并自检 P1/P2，默认）；"
+                             "proximity=指尖接近按钮帽；press=按钮关节真实位移（物理按下）。"
+                             "官方评分不看按钮是否被按下，只看末端到按钮 site 的距离曲线")
+    parser.add_argument("--target_site_dist", type=float, default=0.047,
+                        help="official 模式瞄准距离(米)：ee_site 到按钮 site 的目标距离。"
+                             "得分曲线顶点在 0.05m，且噪声只在 d>0.05m 时施加，"
+                             "故取在顶点近侧（默认 0.047）以避开噪声。"
+                             "注意：末端受按钮阻挡，实际能到的最近距离约 70mm；把本值继续调小"
+                             "并不能让末端更靠近，只会把 OSC 残差转成接触力、令基座漂移翻倍（实测）")
+    parser.add_argument("--retract_back", type=float, default=0.14,
+                        help="official 模式后撤距离(米)：按完一个按钮沿法向退出该距离再横移，"
+                             "避免贴柜面平移让途经按钮刷出高分帧而触发 P1")
+    parser.add_argument("--min_step_score", type=float, default=8.5,
+                        help="official 模式闸门：每个按钮按官方口径估出的得分(满分10)低于该值即整集判废。"
+                             "实测（Windows/RTX4060Ti）：不深压按钮时 OSC 能稳定到达的官方距离下限约 70mm，"
+                             "对应估分 8.8~9.6；阈值取 8.5 只拦真正的异常（OSC 完全没到位、按错、"
+                             "P1 触发），调高会显著提高丢弃率而对训练数据质量帮助有限")
     parser.add_argument("--proximity_threshold", type=float, default=0.045,
                         help="proximity 模式：按压窗口内指尖 geom 中心到帽心的最小距离(米)低于该值，"
                              "或按钮出现任何真实位移，视为成功（geom 中心距指尖表面约有 15~20mm 固有偏置）")
@@ -554,23 +758,19 @@ def main() -> None:
                         help="保留按压失败的集（默认丢弃，均在 quality.jsonl 记录）")
     parser.add_argument("--no_recenter", action="store_true",
                         help="不用按钮刚体位置修正候选位姿的 y/z（默认修正；候选原值偏离按钮中心 6~32mm）")
-    parser.add_argument("--steps_approach", type=int, default=250)
+    parser.add_argument("--steps_approach", type=int, default=None,
+                        help="接近段步数。默认：official 模式 700，其余 250")
     parser.add_argument("--steps_push", type=int, default=None,
                         help="前推段步数。默认：proximity 模式 120；press 模式 400（实测慢推才能可靠压下按钮）")
     parser.add_argument("--steps_hold", type=int, default=None,
                         help="保压段步数。默认：proximity 模式 40；press 模式 200")
-    parser.add_argument("--steps_retract", type=int, default=150)
+    parser.add_argument("--steps_retract", type=int, default=None,
+                        help="后撤段步数。默认：official 模式 600，其余 150")
     parser.add_argument("--clock", choices=("sim", "wall"), default="wall")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
-    args._contact_dy, args._contact_dz = (float(x) for x in args.contact_offset.split(","))
-    if args.press_depth is None:
-        args.press_depth = 0.010 if args.success_mode == "proximity" else 0.040
-    if args.steps_push is None:
-        args.steps_push = 120 if args.success_mode == "proximity" else 400
-    if args.steps_hold is None:
-        args.steps_hold = 40 if args.success_mode == "proximity" else 200
+    apply_mode_defaults(args)
     length_weights = [float(x) for x in args.length_weights.split(",")]
     assert len(length_weights) >= args.max_buttons, "--length_weights 至少要给出 max_buttons 个权重"
 
@@ -706,6 +906,25 @@ def main() -> None:
     if any(v is None for v in color2site.values()):
         orca_logger.warning(f"[标定] 按钮 site 缺失: {color2site}，官方口径闸门将不生效")
 
+    def _site_pos_B(color: str) -> np.ndarray:
+        """按钮 site 的实时 B 系位置（官方判定就用这个 site）。site 缺失时回退到帽心。"""
+        sid = color2site.get(color)
+        if sid is None:
+            return _cap_pos_B(color2cap[color])
+        mujoco.mj_forward(_mj_m, _mj_d)
+        Rb = _mj_d.xmat[_base_raw].reshape(3, 3)
+        return Rb.T @ (_mj_d.site_xpos[sid] - _mj_d.xpos[_base_raw])
+
+    if args.success_mode == "official":
+        if any(v is None for v in color2site.values()):
+            orca_logger.error("official 模式需要全部四个按钮 site，当前缺失，退出")
+            env.close()
+            return
+        for _c in _COLOR_ORDER:
+            if _c in color2site:
+                orca_logger.info(
+                    f"[标定] {_COLOR_CN[_c]} site B={_site_pos_B(_c).round(4).tolist()}")
+
     # 双臂 OSC + 双夹爪控制器。做成可重建：控制器在创建时绑定 model 对象，
     # 场景异步 publish 会替换 model，持有过期引用的 OSC 表现为 ~10 倍跟踪迟滞
     # （进程级随机病态的根因嫌疑）。每集重建以确保绑定当前 model。
@@ -713,7 +932,8 @@ def main() -> None:
         ctrl_l_name = [env.actuator(m) for m in agent_conf.l_arm["motors_names"]]
         ctrl_r_name = [env.actuator(m) for m in agent_conf.r_arm["motors_names"]]
         # v2：左臂用关节 PD 锁定（重力前馈），彻底消除左臂噪声进入数据
-        l_arm = JointLockController(env, agent_conf.l_arm, ctrl_l_name)
+        l_arm = JointLockController(env, agent_conf.l_arm, ctrl_l_name,
+                                    kp=LEFT_LOCK_KP, kd=LEFT_LOCK_KD, hard_lock=True)
         r_arm = create_arm_osc_controller(env, agent_conf.r_arm, agent_conf.base_body, ctrl_r_name,
                                           dict(zip(ctrl_r_name, agent_conf.r_arm["motors_init_ctrl"])))
         l_gname = [env.actuator(n) for n in agent_conf.gripper_l["actuator_names"]]
@@ -733,6 +953,11 @@ def main() -> None:
     task_status = TaskStatusController(env, agent_conf.base_body, is_controller=False)
     manager.set_task_status_controller(task_status)
     manager.set_task(EmptyTask(env))
+
+    # 相机解码线程一旦跑起来，再首次导入 lerobot/datasets 会让进程直接崩溃，
+    # 所以在拉起相机之前先把这些导入做完（详见 LeRobotDatasetWriter.preload）。
+    LeRobotDatasetWriter.preload()
+    orca_logger.info("LeRobot 依赖已预加载")
 
     # 相机
     cameras: dict = {}
@@ -757,6 +982,11 @@ def main() -> None:
         orca_logger.warning("--resume 指定但数据集尚不存在（meta/info.json 缺失），改为全新创建")
         args.resume = False
 
+    # NVENC 会话在此创建。相机解码线程此时已在运行，二者同时调用 avcodec_open2
+    # 曾在 Linux 上触发 libnvcuvid 崩溃；这两行日志用于区分「崩在建会话」与「崩在别处」。
+    orca_logger.info(
+        f"创建 LeRobot 写入器: root={lerobot_out} fps={args.fps} "
+        f"相机={list(camera_map)} 分辨率={cam_hw}")
     writer = LeRobotDatasetWriter.create(
         repo_id=args.repo_id,
         root=lerobot_out,
@@ -768,6 +998,7 @@ def main() -> None:
         resume=args.resume,
         robot_type="g1_omnipicker",
     )
+    orca_logger.info("LeRobot 写入器就绪")
     storage.configure_lerobot(
         fps=args.fps, cameras=cameras, camera_map=camera_map, target_hw=cam_hw,
         writer=writer, task="g1 button combo", clock=args.clock,
@@ -827,7 +1058,7 @@ def main() -> None:
                     orca_logger.warning(f"[瞬移] FK 读取失败: {_e}")
                 l_arm, r_arm, l_grip, r_grip = build_controllers()
                 segments, windows, press_params, pre_roll = build_combo_segments(
-                    seq, buttons, lambda c: _cap_pos_B(color2cap[c]),
+                    seq, buttons, lambda c: _cap_pos_B(color2cap[c]), _site_pos_B,
                     _query_r_start(), approach_back, g_close, args, rng, bins,
                     archive=traj_archive)
                 l_pos, l_quat, r_pos, r_quat_traj, l_gm, r_gm = scripted.build_segmented_trajectory(
@@ -838,9 +1069,14 @@ def main() -> None:
                     env, button_joints, windows,
                     l_arm, r_arm, l_grip, r_grip, task_status,
                     l_pos, l_quat, r_pos, r_quat_traj, l_gm, r_gm,
-                    mj_ctx=(_mj_m, _mj_d, _base_raw, _robot_geom_ids, win_caps, _ee_sid,
-                            [color2site[w["color"]] for w in windows]),
-                    pre_roll=pre_roll)
+                    mj_ctx=MjCtx(
+                        model=_mj_m, data=_mj_d, base_raw_id=_base_raw,
+                        robot_geom_ids=_robot_geom_ids, window_cap_gids=win_caps,
+                        ee_site_id=_ee_sid,
+                        window_site_ids=[color2site[w["color"]] for w in windows],
+                        all_button_site_ids=color2site),
+                    pre_roll=pre_roll,
+                    lock_joints=[env.joint(j) for j in agent_conf.gripper_l["joint_names"]])
                 manager.set_device(device)
                 # 防御：位标志会被任何 model 重载冲掉（竞态随机出现），每集强制重设并验证。
                 # position 伺服组若复活会与 OSC 力矩对抗，手速降 ~10 倍停在力平衡点。
@@ -875,7 +1111,27 @@ def main() -> None:
                     pressed_joint = max(disp, key=disp.get) if disp else None
                     min_dist = obs_rec.get("min_cap_dist", float("inf"))
                     min_site = obs_rec.get("min_site_dist", float("inf"))
-                    if args.success_mode == "proximity":
+                    best_ratio = float(obs_rec.get("best_ratio") or 0.0)
+                    best_dist = obs_rec.get("best_dist")
+                    best_t = obs_rec.get("best_t")
+                    best_t_s = round(best_t * ctrl_dt, 3) if best_t is not None else None
+                    p1_ok = obs_rec.get("best_p1_ok")
+                    step_score = None
+                    if args.success_mode == "official":
+                        # 官方口径：最佳帧比率 × 满分，再按 P1 打折（P2 在集末统一算）
+                        step_score = OFFICIAL_STEP_SCORE * best_ratio
+                        if p1_ok is False:
+                            step_score *= OFFICIAL_P1_DISCOUNT
+                            orca_logger.warning(
+                                f"[P1] {w['color']} 最佳帧上离 {obs_rec.get('best_nearest')} 更近，"
+                                f"该步 ×{OFFICIAL_P1_DISCOUNT}")
+                        success = step_score >= args.min_step_score
+                        if not success:
+                            orca_logger.warning(
+                                f"[官方口径] {w['color']} 估分 {step_score:.2f} < "
+                                f"{args.min_step_score:.2f}（最佳帧距离 "
+                                f"{(best_dist or float('nan')) * 1000:.1f}mm），本集判废")
+                    elif args.success_mode == "proximity":
                         success = (min_dist <= args.proximity_threshold
                                    or target_disp >= args.press_threshold)
                     else:
@@ -903,12 +1159,38 @@ def main() -> None:
                         "min_site_dist_m": round(min_site, 4) if min_site != float("inf") else None,
                         "inplane_at_min_m": (round(obs_rec["inplane_at_min"], 4)
                                              if obs_rec.get("inplane_at_min") is not None else None),
+                        # 官方口径估分所需字段（最佳帧 = 得分曲线上比率最高的一帧）
+                        "official_score": round(step_score, 2) if step_score is not None else None,
+                        "best_site_dist_m": round(best_dist, 4) if best_dist is not None else None,
+                        "best_t_s": best_t_s,
+                        "aim_err_m": (round(obs_rec["min_aim_dist"], 4)
+                                      if obs_rec.get("min_aim_dist") not in (None, float("inf"))
+                                      else None),
+                        "p1_ok": p1_ok,
+                        "nearest_at_best": obs_rec.get("best_nearest"),
                         "success": bool(success),
                         "wrong_button": bool(wrong_button),
                         "press_time_s": round((press_t - w["t0"]) * ctrl_dt, 3) if press_t is not None else None,
                         **pp,
                     })
                     all_success = all_success and success and not wrong_button
+
+                # P2 速通自检：四钮最佳帧跨度 ≤20s 会让四个按钮的得分全部打折。
+                # 官方仅在凑满 4 个按钮时应用，故 1~3 钮的集只记录跨度、不判废。
+                p2_discount, p2_reason = 1.0, ""
+                if args.success_mode == "official":
+                    _bt = [p["best_t_s"] for p in presses if p.get("best_t_s") is not None]
+                    _bd = [p["best_site_dist_m"] for p in presses
+                           if p.get("best_site_dist_m") is not None]
+                    p2_discount, p2_reason = apply_p2_discount(_bt, _bd)
+                    if p2_discount < 1.0:
+                        all_success = False
+                        orca_logger.warning(
+                            f"[P2 速通] {p2_reason}，四钮得分将被 ×{p2_discount}，本集判废")
+                    for p in presses:
+                        if p.get("official_score") is not None:
+                            p["official_score_final"] = round(
+                                p["official_score"] * p2_discount, 2)
 
                 if args.max_cam_gap_s > 0 and cam_gap > args.max_cam_gap_s:
                     all_success = False
@@ -922,6 +1204,17 @@ def main() -> None:
                     "cam_max_gap_s": round(float(cam_gap), 3),
                     "base_drift_m": round(float(getattr(device, "base_drift", float("nan"))), 4),
                 }
+                if args.success_mode == "official":
+                    _scores = [p.get("official_score_final") for p in presses
+                               if p.get("official_score_final") is not None]
+                    _times = [p["best_t_s"] for p in presses if p.get("best_t_s") is not None]
+                    metrics["official_score_sum"] = round(sum(_scores), 2) if _scores else None
+                    metrics["official_score_min"] = round(min(_scores), 2) if _scores else None
+                    metrics["best_frame_span_s"] = (round(max(_times) - min(_times), 2)
+                                                    if len(_times) >= 2 else 0.0)
+                    metrics["p2_discount"] = p2_discount
+                    if p2_reason:
+                        metrics["p2_reason"] = p2_reason
 
                 keep = all_success or args.keep_failed
                 if keep:

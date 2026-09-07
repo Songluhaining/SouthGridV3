@@ -436,7 +436,7 @@ class StripHandle:
 def install(env, agent_name: str, *, keep=KEEP_DEFAULT, keep_base: bool = False,
             kill_collision: bool = True, required_cameras=("cam_head", "wrist_r"),
             bake_qpos: dict | None = None,
-            dump_dir: str = "/tmp/g1_joint_strip", log=print) -> StripHandle:
+            dump_dir: str | None = None, log=print) -> StripHandle:
     """安装任务模型配置。
 
     env=None 时在 DataCollectionManager 创建前安装；传入 env 时作用于该实例。
@@ -456,6 +456,10 @@ def install(env, agent_name: str, *, keep=KEEP_DEFAULT, keep_base: bool = False,
             log("[MODEL] 当前环境不支持任务模型配置，使用默认模型")
             return h
     h._gym = gym
+    if dump_dir is None:
+        from dataStorage.lerobot_camera import scratch_dir
+
+        dump_dir = scratch_dir("g1_joint_strip")
     os.makedirs(dump_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
 

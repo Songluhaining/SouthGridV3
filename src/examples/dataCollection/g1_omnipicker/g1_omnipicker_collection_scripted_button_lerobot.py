@@ -35,6 +35,7 @@ from dataStorage.lerobot_camera import (
     bring_up_cameras,
     close_cameras,
     probe_camera_hw,
+    scratch_dir,
 )
 
 BUTTON_CAMERA_MAP = {
@@ -48,7 +49,7 @@ from scene.scene_manager import SceneManager
 from task.abstract_task import EmptyTask
 
 ENTRY_POINT = "envs.dataCollection.dataCollection_env:DataCollectionEnv"
-STREAM_TRIGGER_PATH = "/tmp/g1_scripted_button_lerobot_stream"
+STREAM_TRIGGER_PATH = scratch_dir("g1_scripted_button_lerobot_stream")
 
 log_dir = os.path.join(base_dir, "logs")
 

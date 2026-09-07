@@ -517,6 +517,19 @@ class LeRobotDatasetWriter:
         self._saved_episodes: int = 0
         self._frame_idx: int = 0
 
+    @staticmethod
+    def preload() -> None:
+        """提前完成 lerobot / datasets 的导入。
+
+        这两个模块原本在 create() 里才第一次导入。Windows 实测：若此时两路相机的
+        av 解码线程已在运行，加载 datasets 的原生依赖会让整个进程直接退出——没有
+        Python 异常、没有 traceback，只有 faulthandler 能看到栈停在
+        datasets/packaged_modules/audiofolder。因此入口脚本应在启动相机之前调用本
+        方法，把导入放在进程还干净的时候完成。
+        """
+        _import_lerobot_dataset()
+        _import_video_encoding_manager()
+
     @classmethod
     def create(
         cls,

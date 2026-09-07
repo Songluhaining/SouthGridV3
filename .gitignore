@@ -216,3 +216,6 @@ __marimo__/
 # Local workspace notes
 DOCS_CHECK.md
 TODO.md
+
+# 交付指南 PDF 标注「禁止扩散传播」，不入库
+*.pdf

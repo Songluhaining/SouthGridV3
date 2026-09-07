@@ -48,6 +48,7 @@ from dataStorage.lerobot_camera import (
     close_cameras,
     omnipicker_camera_map,
     probe_camera_hw,
+    scratch_dir,
 )
 from dataStorage.lerobot_data_storage import G1OmniPickerLeRobotStorage
 from devices.abstract_device import AbstractDevice
@@ -55,7 +56,7 @@ from scene.scene_manager import SceneManager
 from task.abstract_task import EmptyTask
 
 ENTRY_POINT = "envs.dataCollection.dataCollection_env:DataCollectionEnv"
-STREAM_TRIGGER_PATH = "/tmp/eval_g1_lerobot_stream"
+STREAM_TRIGGER_PATH = scratch_dir("eval_g1_lerobot_stream")
 
 base_dir = os.path.dirname(os.path.realpath(__file__))
 log_dir = os.path.join(base_dir, "logs")
@@ -572,7 +573,7 @@ def main():
     scene_manager = SceneManager(args.orcagym_addr, config=config)
 
     # storage 仅用于 obs_callback 与 build_state，不落盘；左臂通道写常数与采集一致。
-    storage = G1OmniPickerLeRobotStorage(dataset_path="/tmp/_eval_g1_scratch", lock_left=True)
+    storage = G1OmniPickerLeRobotStorage(dataset_path=scratch_dir("_eval_g1_scratch"), lock_left=True)
 
     manager = DataCollectionManager(
         agent_name="g1_omnipicker",

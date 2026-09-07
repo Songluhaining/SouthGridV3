@@ -53,6 +53,7 @@ from dataStorage.lerobot_camera import (
     bring_up_cameras,
     close_cameras,
     probe_camera_hw,
+    scratch_dir,
 )
 from dataStorage.lerobot_data_storage import LeRobotDatasetWriter
 from devices.abstract_device import AbstractDevice
@@ -61,7 +62,7 @@ from scene.scene_manager import SceneManager
 from task.abstract_task import EmptyTask
 
 ENTRY_POINT = "envs.dataCollection.dataCollection_env:DataCollectionEnv"
-STREAM_TRIGGER_PATH = "/tmp/g1_pick_osc_lerobot_stream"
+STREAM_TRIGGER_PATH = scratch_dir("g1_pick_osc_lerobot_stream")
 _L_INIT_JOINT_VALUES = [0.0, 0.127, 0.0, 1.5708, 0.0, 0.0, 0.0]
 
 log_dir = os.path.join(base_dir, "logs")
