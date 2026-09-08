@@ -506,6 +506,14 @@ def main():
     parser.add_argument("--prompts", type=str, nargs="+", default=None,
                         help="同一集（同一 attempt）内依次执行的多条指令，每条之间先回到预备位姿；"
                              "给出时忽略 --prompt，--max_steps 为每条指令的步数预算")
+    parser.add_argument("--auto_segment", action="store_true",
+                        help="把 --prompt 里的官方指令解析成颜色序列，逐个下发与训练逐字一致的"
+                             "规范单色指令「按X按钮」；给出时忽略 --prompts")
+    parser.add_argument("--return_move_steps", type=int, default=600,
+                        help="两条指令之间回预备位姿的插值步数。官方 P2 规则要求四钮最佳帧跨度 >20s，"
+                             "按压约 4.2s/次时回位需 >2.5s(500步)，默认 500 留余量")
+    parser.add_argument("--return_settle_steps", type=int, default=200,
+                        help="回到预备位姿后钉住目标等 OSC 收敛的控制步数")
     parser.add_argument("--sleep", action="store_true", help="按 real_time_step 节奏运行")
     parser.add_argument("--max_steps", type=int, default=6000,
                         help="每集最大控制步数（5 ms/步；目标全部按下会提前结束）")
@@ -671,7 +679,14 @@ def main():
             # 按压成功判定：从 prompt 解析目标颜色，监测按钮关节位移与接近距离。
             # env.reset() 会重新加载 MuJoCo 模型，mjModel/mjData 句柄失效，因此每集重建。
             button_monitor = ButtonPressMonitor(env, args.success_disp, args.success_dist)
-            _prompts = args.prompts or [args.prompt]
+            if args.auto_segment:
+                _seq_auto = colors_from_prompt(args.prompt)
+                if not _seq_auto:
+                    raise SystemExit("--auto_segment 需要 --prompt 中至少包含一个颜色词")
+                _prompts = [f"按{_COLOR_CN[c]}按钮" for c in _seq_auto]
+                orca_logger.info("[auto_segment] 「" + args.prompt + "」-> " + " | ".join(_prompts))
+            else:
+                _prompts = args.prompts or [args.prompt]
             _seg_targets = [colors_from_prompt(p) for p in _prompts]
             _targets = [c for seg in _seg_targets for c in seg]
             button_monitor.start_episode(_targets)
@@ -869,7 +884,7 @@ def main():
                     _cur = action_dict_for_apply(parse_policy_action(
                         storage.build_state(storage.obs_callback(env))))
                     _ready_apply = drive_to_ready(manager, env, device, _cur,
-                                                  args.ready_move_steps, args.settle_steps)
+                                                  args.return_move_steps, args.return_settle_steps)
                     device.set_target(**action_dict_for_apply(parse_policy_action(
                         storage.build_state(storage.obs_callback(env)))))
                 orca_logger.info(f"=== 指令 {_si + 1}/{len(_prompts)}: {_p} ===")
