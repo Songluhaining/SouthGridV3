@@ -7,6 +7,25 @@
 
 ---
 
+## 0. 三分钟快速上手（给训练侧）
+
+**一句话原理**：策略只负责"从预备位姿按一个指定颜色的按钮"，序列调度和按完回位交给评测脚本。
+这样每一段的起点都与训练数据一致，语言信号也最干净。
+
+| 要做的 | 怎么做 |
+|---|---|
+| 拿数据 | `g1_button_v6`：800 集纯单色，61,621 帧，496 MB。打包好后由采集方传给你 |
+| 归一化 | **必须重算**（换数据集了）：`compute_norm_stats.py --config-name pi05_g1_button_lora` |
+| 训练 | `--num-train-steps 12000 --lr-schedule.decay-steps 12000`（两个都要改，只改前者会导致学习率降不到位）；24 GB 卡 `--batch-size 16` |
+| 评测 | `--auto_segment --action_repeat 10 --max_steps 3000`，官方指令原样传给 `--prompt` |
+| 验收 | 训完先跑离线接地探针，单色接地 ≥85% 再上仿真器 |
+
+**三个不要**：不要和 v4/v5 混训（时序基准不同）；不要传 `--success_mode press`（几何会偏 4 厘米）；
+不要用 `--action_repeat 1`（那是官方指南示例里的值，会让机器人快 10 倍、够不到按钮）。
+
+
+---
+
 ## 1. 方案
 
 **训练**：只用单色数据，每集"从预备位姿出发 → 按一个按钮"，指令固定为 `按X按钮`。
@@ -197,3 +216,34 @@ g1_button_v6/
 ├─ videos/   1600 个 mp4（两路相机 × 800 集，AV1，480×640）
 └─ meta/     info.json / episodes.jsonl / episodes_stats.jsonl / tasks.jsonl / quality.jsonl
 ```
+
+
+---
+
+## 8. 训练侧已知坑：首次存档时可能 OOM
+
+在 HPC 的内存受限容器里实测到一个**可复现**的崩溃：训练跑到第一次保存检查点（第 1000 步）时退出，
+日志里是
+
+```
+RuntimeError: DataLoader worker (pid xxxxx) is killed by signal: Killed.
+```
+
+随后跟着 orbax 的 `cannot schedule new futures after shutdown`。**后者是后果，不是原因**——
+真正的原因是内核 OOM killer 杀掉了数据读取子进程。
+
+机理：pi0.5 保存检查点要把完整权重（约 12.5 GB）从显存拷到内存，orbax 的异步存档在写盘期间
+还会多留一份；再加上每个数据读取子进程都带一份 JAX 运行时（约 2 GB），内存瞬间冲高。
+容器里 `top`/`free` 看到的是**宿主机**内存，不是容器配额，很容易误判为"内存充足"。
+查真实配额：`cat /sys/fs/cgroup/memory.max`（v2）或 `/sys/fs/cgroup/memory/memory.limit_in_bytes`（v1）。
+
+缓解手段（按性价比排序）：
+
+1. **`--num-workers 1`**（甚至 0）。已经量过，这个任务是 GPU 算力受限（A100 上 3.6 秒/步，
+   把数据解码完全去掉也不变快），读 JPEG 很便宜，1 个子进程完全喂得饱，却能省下好几 GB。
+2. **检查点写本地盘**：`--checkpoint-base-dir /tmp/ckpt`。写网络盘慢，异步存档期间那份内存拷贝
+   一直挂着；写本地盘能大幅缩短这个窗口。记得事后手动拷一份到持久存储。
+3. **`--save-interval 2000`**：少几次内存尖峰。
+
+台式机（如 4090 + 大内存）通常不会遇到。但**如果训练恰好崩在第一次保存检查点，先查这个**，
+别浪费时间去查数据或终端会话——我们在这上面误判过两次。

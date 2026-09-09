@@ -1,5 +1,8 @@
 # g1_button_v5 训练集：补采结果与训练/评测指引
 
+> ⚠️ **本文所述方案已被取代。当前有效方案见 [g1_button_v6_single_color_plan.md](g1_button_v6_single_color_plan.md)。**
+> 本文保留是为了记录当时的分析与实测数字，其中的采集/训练/评测参数**不要再照做**。
+
 本文接续 [g1_button_v4_dataset_eval.md](g1_button_v4_dataset_eval.md) 与
 [g1_button_v4_supplement.md](g1_button_v4_supplement.md)。v4 训出的模型忽略颜色指令
 （单色接地 25% ≈ 四选一随机），根因是四键任务占 62% 训练帧。本文记录**补采 300 集单色数据**、
