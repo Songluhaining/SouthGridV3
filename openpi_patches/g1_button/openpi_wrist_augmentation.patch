@@ -1,0 +1,84 @@
+diff --git a/src/openpi/models/model.py b/src/openpi/models/model.py
+index 03cd3a7..6d34a9e 100644
+--- a/src/openpi/models/model.py
++++ b/src/openpi/models/model.py
+@@ -162,6 +162,8 @@ def preprocess_observation(
+     train: bool = False,
+     image_keys: Sequence[str] = IMAGE_KEYS,
+     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
++    wrist_aug_crop: float = 1.0,
++    wrist_aug_rotate_deg: float = 0.0,
+ ) -> Observation:
+     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
+     filling in a default image mask (if necessary).
+@@ -184,13 +186,24 @@ def preprocess_observation(
+             image = image / 2.0 + 0.5
+ 
+             transforms = []
++            height, width = image.shape[1:3]
+             if "wrist" not in key:
+-                height, width = image.shape[1:3]
+                 transforms += [
+                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+                     augmax.Resize(width, height),
+                     augmax.Rotate((-5, 5)),
+                 ]
++            elif wrist_aug_crop < 1.0 or wrist_aug_rotate_deg > 0.0:
++                # SouthGrid 按钮任务：上游默认跳过腕相机的几何增强，导致策略对腕相机
++                # 视角零容差——实测评测帧偏 6~7px（480x640）即可让预测偏 60~80mm，
++                # 而换成任意合法训练帧只差 20mm。见 docs/g1_button_v6_eval_image_ood.md。
++                if wrist_aug_crop < 1.0:
++                    transforms += [
++                        augmax.RandomCrop(int(width * wrist_aug_crop), int(height * wrist_aug_crop)),
++                        augmax.Resize(width, height),
++                    ]
++                if wrist_aug_rotate_deg > 0.0:
++                    transforms += [augmax.Rotate((-wrist_aug_rotate_deg, wrist_aug_rotate_deg))]
+             transforms += [
+                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+             ]
+diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+index 140d317..de8f065 100644
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -87,6 +87,8 @@ class Pi0(_model.BaseModel):
+         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+         self.pi05 = config.pi05
+         self.use_dino_subgoal = config.use_dino_subgoal
++        self.wrist_aug_crop = config.wrist_aug_crop
++        self.wrist_aug_rotate_deg = config.wrist_aug_rotate_deg
+         self.dino_latent_dim = config.dino_latent_dim
+         self.dino_world_loss_weight = config.dino_world_loss_weight
+         paligemma_config = _gemma.get_config(config.paligemma_variant)
+@@ -251,7 +253,13 @@ class Pi0(_model.BaseModel):
+         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+     ) -> at.Float[at.Array, "*b ah"]:
+         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
++        observation = _model.preprocess_observation(
++            preprocess_rng,
++            observation,
++            train=train,
++            wrist_aug_crop=self.wrist_aug_crop,
++            wrist_aug_rotate_deg=self.wrist_aug_rotate_deg,
++        )
+ 
+         dino_subgoal = None
+         if self.use_dino_subgoal:
+diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
+index a93c9c8..962232d 100644
+--- a/src/openpi/models/pi0_config.py
++++ b/src/openpi/models/pi0_config.py
+@@ -36,6 +36,12 @@ class Pi0Config(_model.BaseModelConfig):
+     dino_predictor_hidden_dim: int = 512
+     dino_world_loss_weight: float = 0.1
+ 
++    # 腕相机几何增强强度（上游默认完全不增强腕相机）。
++    # wrist_aug_crop<1 时随机裁剪到该比例再缩放回原尺寸（等效随机平移 + 轻微缩放）；
++    # wrist_aug_rotate_deg>0 时额外随机旋转 ±该角度。
++    wrist_aug_crop: float = 1.0
++    wrist_aug_rotate_deg: float = 0.0
++
+     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
+     discrete_state_input: bool = None  # type: ignore
+ 
