@@ -450,6 +450,20 @@ def build_default_joint_values() -> dict:
     return d
 
 
+def _log_arm_q(env, tag: str) -> None:
+    """打印右臂关节角与标称预备位形的逐关节偏差（零空间漂移诊断）。"""
+    try:
+        import numpy as _np
+        names = agent_conf.r_arm["joint_names"]
+        cur = env.query_joint_qpos([env.joint(j) for j in names])
+        q = _np.array([float(_np.ravel(cur[env.joint(j)])[0]) for j in names])
+        ref = _np.asarray(agent_conf.r_arm_ready["joint_values"], dtype=float)
+        d = _np.degrees(q - ref)
+        orca_logger.info(f"[关节] {tag} 偏差(度) {_np.round(d, 3).tolist()} 最大 {_np.abs(d).max():.3f}")
+    except Exception as _e:
+        orca_logger.warning(f"[关节] {tag} 读取失败: {_e}")
+
+
 def teleport_to_ready(env) -> None:
     """每集起点：右臂瞬移到 L 型预备位形、左臂回中立位（与采集数据首帧一致）。"""
     q = {env.joint(j): np.array([v]) for j, v in
@@ -522,6 +536,15 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="评估集数")
     parser.add_argument("--camera_warmup_steps", type=int, default=10,
                         help="每集推理前相机预热步数（默认 10）")
+    parser.add_argument("--diag_skip_set_ctrl", action="store_true",
+                        help="跳过 env.set_ctrl(manager.ctrl)，与采集脚本一致")
+    parser.add_argument("--no_default_joints", action="store_true",
+                        help="不在 update_scene() 之后重设默认关节角（旧行为，仅用于对照）")
+    parser.add_argument("--diag_teleport_dump", action="store_true",
+                        help="诊断用：抓完首帧后瞬移回标称关节角再抓一张（会破坏本集）")
+    parser.add_argument("--ready_mode", choices=("servo", "hold"), default="servo",
+                        help="servo=OSC 笛卡尔伺服到标称预备位（旧行为，会把冗余自由度推离采集位形）；"
+                             "hold=直接钉住瞬移后的位形，与采集逐关节一致")
     parser.add_argument("--start_pose", choices=("ready", "neutral"), default="ready",
                         help="起点：ready=复现 v3 采集的 L 型预备位姿前导段；neutral=沿用场景默认位姿"
                              "（评估 v2 及更早、以默认位姿起步采集的模型时使用）")
@@ -655,12 +678,23 @@ def main():
                 orca_logger.error("场景更新失败，退出")
                 return
 
+            # update_scene() 会重新 publish 场景并重载 MuJoCo 模型，构造 manager 时传入的
+            # default_joint_values 会被冲掉。采集脚本在 update_scene() 之后、且每集都重设一次
+            # （见 ..._button_combo_lerobot.py 的 env.set_default_joint_values）；评测原先漏了这步，
+            # 机器人的静息站姿因此与采集不同，两路相机同时偏移（实测头相机静止背景偏 5px）。
+            if not args.no_default_joints:
+                env.set_default_joint_values(build_default_joint_values())
+
             # 与采集一致：瞬移到 L 型预备位形，再重建控制器（左臂关节锁以当前位形为目标）
             if args.start_pose == "ready":
                 teleport_to_ready(env)
+                _log_arm_q(env, "瞬移后(应为0)")
             l_arm, r_arm, l_grip, r_grip = build_controllers(manager, env)
             manager.set_init_ctrl()
-            env.set_ctrl(manager.ctrl)
+            # manager.ctrl 只有手臂/夹爪下标被 set_init_ctrl 填过，腿部与腰部仍是 0；
+            # 整条写进去等于把下盘指令清零，机器人站姿随之改变（采集脚本从不调 set_ctrl）。
+            if not args.diag_skip_set_ctrl:
+                env.set_ctrl(manager.ctrl)
             env.mj_forward()
             for controller in manager.controllers:
                 controller.reset()
@@ -742,8 +776,17 @@ def main():
             # 起点（不计入评分）：与采集前导段一致地驶向 L 型预备位姿，使首帧观测与训练数据同分布；
             # 随后以稳定后的实测位姿作为策略的初始末端目标。
             if args.start_pose == "ready":
-                _ready_apply = drive_to_ready(manager, env, device, _init_action_apply,
-                                              args.ready_move_steps, args.settle_steps)
+                if args.ready_mode == "hold":
+                    # 瞬移已把右臂放在与采集逐关节一致的位形上；再做一次笛卡尔伺服只会
+                    # 把 7 自由度臂的冗余维推到 OSC 自己的解上（实测最大偏 97°），
+                    # 末端残差 1.4mm 即可让腕相机偏约 6px，而策略对此高度敏感。
+                    _ready_apply = dict(_init_action_apply,
+                                        r_grip_ctrl=np.array([READY_R_GRIP_CTRL] * 2, dtype=np.float32))
+                    hold_target(manager, env, device, _ready_apply, args.settle_steps)
+                else:
+                    _ready_apply = drive_to_ready(manager, env, device, _init_action_apply,
+                                                  args.ready_move_steps, args.settle_steps)
+                _log_arm_q(env, f"预备位({args.ready_mode})后")
                 _start_state = storage.build_state(storage.obs_callback(env))
                 _start_err = float(np.linalg.norm(_start_state[7:10] - _ready_apply["r_pos_b"]))
                 _start_ang = float(np.degrees((R.from_quat(_start_state[10:14])
@@ -808,6 +851,19 @@ def main():
                                 cv2.imwrite(os.path.join(args.dump_dir, f"ep{episode_index + 1}_{_k}.png"),
                                             cv2.cvtColor(_hwc, cv2.COLOR_RGB2BGR))
                                 orca_logger.info(f"[调试] {_k}: shape={_img.shape} mean={_img.mean():.1f}")
+                            # 诊断：把右臂瞬移回标称关节角（= 采集首帧位形），立刻再抓一张。
+                            # 若这张与训练首帧吻合 -> 6px 偏移来自末端位姿残差；
+                            # 若仍偏 -> 偏移来自取图链路本身。会破坏本集，仅用于诊断。
+                            if args.diag_teleport_dump:
+                                teleport_to_ready(env)
+                                env.render()
+                                _log_arm_q(env, "诊断瞬移后")
+                                _st2 = storage.build_state(storage.obs_callback(env))
+                                orca_logger.info(f"[诊断] 瞬移后右手 ee={np.round(_st2[7:10], 4).tolist()}")
+                                for _k, _img in policy_runner.build_observation(_st2)["images"].items():
+                                    cv2.imwrite(os.path.join(args.dump_dir, f"tp_{_k}.png"),
+                                                cv2.cvtColor(np.transpose(_img, (1, 2, 0)), cv2.COLOR_RGB2BGR))
+                                orca_logger.info("[诊断] 瞬移帧已保存")
 
                     for model_action in action_chunk:
                         if step >= seg_end or truncated or seg_done or _interrupt.is_set():
