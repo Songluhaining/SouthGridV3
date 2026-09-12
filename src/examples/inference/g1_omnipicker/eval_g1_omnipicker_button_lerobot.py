@@ -113,6 +113,14 @@ class EEFDevice(AbstractDevice):
         self.r_arm = r_arm
         self.l_grip = l_grip
         self.r_grip = r_grip
+        # 与采集脚本一致的左爪运动学锁定（见 ..._button_combo_lerobot.py 的 lock_joints）。
+        # 左爪是欠驱动连杆：被驱动的是 joint2，conf 里观测的是 joint1，position 执行器
+        # 给定 ctrl 后 joint1 会滑到平衡位形。采集每步钉住它，评测原先没有——
+        # 实测评测首帧左爪比采集偏 22°、左臂偏 16°，质量分布随之改变，
+        # 整车轻微倾斜（wheel_bl 差 4.5°），车上所有相机跟着偏。
+        self.env = None
+        self._lock_joints = []
+        self._lock_qpos = None
         self.l_pos_b = None if l_pos_b is None else np.asarray(l_pos_b, dtype=np.float32)
         self.l_quat_b = None if l_quat_b is None else np.asarray(l_quat_b, dtype=np.float32)
         self.r_pos_b = None if r_pos_b is None else np.asarray(r_pos_b, dtype=np.float32)
@@ -143,7 +151,26 @@ class EEFDevice(AbstractDevice):
         if r_grip_ctrl is not None:
             self.r_grip_ctrl = np.asarray(r_grip_ctrl, dtype=np.float32).reshape(2)
 
+    def set_lock_joints(self, env, joints) -> None:
+        self.env = env
+        self._lock_joints = list(joints or [])
+        self._lock_qpos = None
+
+    def _apply_lock(self) -> None:
+        if not self._lock_joints or self.env is None:
+            return
+        try:
+            if self._lock_qpos is None:
+                qp = self.env.query_joint_qpos(self._lock_joints)
+                self._lock_qpos = {j: np.ravel(qp[j]).astype(np.float64).copy()
+                                   for j in self._lock_joints}
+            self.env.set_joint_qpos(self._lock_qpos)
+            self.env.set_joint_qvel({j: np.zeros(1) for j in self._lock_joints})
+        except Exception:
+            pass
+
     def update(self):
+        self._apply_lock()
         if self.l_arm is not None and self.l_pos_b is not None and self.l_quat_b is not None:
             self.l_arm.update_action_position(self.l_pos_b)
             self.l_arm.update_action_axisangle(self.l_quat_b)
@@ -604,6 +631,12 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="评估集数")
     parser.add_argument("--camera_warmup_steps", type=int, default=10,
                         help="每集推理前相机预热步数（默认 10）")
+    parser.add_argument("--diag_hold_dump", type=int, default=0,
+                        help="诊断：预备位静止时连拍 N 张（每张间隔 --diag_hold_gap 个控制步）后退出")
+    parser.add_argument("--diag_hold_gap", type=int, default=20,
+                        help="连拍间隔的控制步数")
+    parser.add_argument("--no_lock_left_grip", action="store_true",
+                        help="不锁左爪（旧行为，仅对照用）；采集脚本是锁的")
     parser.add_argument("--legacy_default_joints", action="store_true",
                         help="构造 manager 时就传默认关节角（旧行为，仅对照用）")
     parser.add_argument("--restore_pose", action="store_true",
@@ -628,8 +661,10 @@ def main():
                              "（评估 v2 及更早、以默认位姿起步采集的模型时使用）")
     parser.add_argument("--ready_move_steps", type=int, default=150,
                         help="每集开始前右手插值驶向 L 型预备位姿的控制步数（与采集前导段一致）")
-    parser.add_argument("--settle_steps", type=int, default=150,
-                        help="到达预备位姿后钉住目标等 OSC 收敛的控制步数（与采集一致；不计入 max_steps）")
+    parser.add_argument("--settle_steps", type=int, default=145,
+                        help="到达预备位姿后钉住目标等 OSC 收敛的控制步数。预备位的画面是一段整定暂态，"
+                             "与训练首帧的距离随该值呈 V 形（settle=0 时 46，145 时谷底 13.1，290 时 20.6）；"
+                             "145 是实测最优，不计入 max_steps")
     parser.add_argument("--no_camera_prep", action="store_true",
                         help="不经 MCP 设置腕相机朝向与重建 IsRecording（已手动设置时使用）")
     parser.add_argument("--mcp_url", type=str, default="http://127.0.0.1:12345/mcp",
@@ -819,6 +854,8 @@ def main():
 
             device = EEFDevice(l_arm=l_arm, r_arm=r_arm, l_grip=l_grip, r_grip=r_grip,
                                **_init_action_apply)
+            if not args.no_lock_left_grip:
+                device.set_lock_joints(env, [env.joint(j) for j in agent_conf.gripper_l["joint_names"]])
             manager.set_device(device)
 
             # 首集：场景就绪后启动相机内存流并连接策略服务器
@@ -893,6 +930,39 @@ def main():
                             orca_logger.warning(f"[恢复] 失败: {_e}")
                 elif args.restore_base:
                     _restore_base(env, globals().get("_BASE_SNAP") or {})
+                if args.diag_hold_dump > 0:
+                    # 预备位静止连拍：若画面之间差异接近"评测 vs 训练"的差异，
+                    # 说明画面本身不稳定（取帧时序/异步流），而不是视角偏移。
+                    import cv2 as _cv2
+                    _od = args.dump_dir or scratch_dir("_hold_dump")
+                    os.makedirs(_od, exist_ok=True)
+                    for _i in range(args.diag_hold_dump):
+                        _stt = storage.build_state(storage.obs_callback(env))
+                        _obs = policy_runner.build_observation(_stt)["images"]
+                        _idx = {}
+                        for _en, (_k, _p) in camera_map.items():
+                            try:
+                                _fr, _ix = _shared_cameras[_en].get_frame(format="rgb24")
+                                _idx[_k] = int(_ix)
+                            except Exception:
+                                _idx[_k] = -1
+                        for _k, _im in _obs.items():
+                            _cv2.imwrite(os.path.join(_od, f"hold{_i:02d}_{_k}.png"),
+                                         _cv2.cvtColor(np.transpose(_im, (1, 2, 0)), _cv2.COLOR_RGB2BGR))
+                        orca_logger.info(f"[连拍] {_i}: 右手 ee={np.round(_stt[7:10],5).tolist()} 帧号={_idx}")
+                        hold_target(manager, env, device, _ready_apply, args.diag_hold_gap)
+                    orca_logger.info("[连拍] 完成，退出")
+                    return
+
+                _snap_out = os.environ.get("JOINT_SNAP_OUT")
+                if _snap_out:
+                    try:
+                        _names = list(env.model.get_joint_dict().keys())
+                        _cur = env.query_joint_qpos(_names)
+                        np.savez(_snap_out, **{n: np.ravel(_cur[n]) for n in _names if n in _cur})
+                        orca_logger.info(f"[快照] 首帧关节角已存至 {_snap_out}（{len(_names)} 个关节）")
+                    except Exception as _e:
+                        orca_logger.warning(f"[快照] 失败: {_e}")
                 _qtp = globals().get("_Q_TP")
                 if _qtp:
                     _diff_all_q(_qtp, _snap_all_q(env), "瞬移后 -> 预备位稳定后")

@@ -589,6 +589,15 @@ class MonitoredTrajectoryDevice(AbstractDevice):
             self.env.set_joint_qvel({j: np.zeros(1) for j in self._lock_joints})
         if self.t == self.pre_roll:
             self.task_status.update_task_status(True)
+            _snap_out = os.environ.get("JOINT_SNAP_OUT")
+            if _snap_out:
+                try:
+                    _names = list(self.env.model.get_joint_dict().keys())
+                    _cur = self.env.query_joint_qpos(_names)
+                    np.savez(_snap_out, **{n: np.ravel(_cur[n]) for n in _names if n in _cur})
+                    orca_logger.info(f"[快照] 录制首帧关节角已存至 {_snap_out}（{len(_names)} 个关节）")
+                except Exception as _e:
+                    orca_logger.warning(f"[快照] 失败: {_e}")
             # 记录录制首帧时的实际右手位置（B 系），供集末做起点质量判定
             try:
                 ctx = self.mj_ctx
