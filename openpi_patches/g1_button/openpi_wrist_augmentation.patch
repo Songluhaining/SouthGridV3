@@ -1,17 +1,18 @@
 diff --git a/src/openpi/models/model.py b/src/openpi/models/model.py
-index 03cd3a7..6d34a9e 100644
+index 03cd3a7..3346929 100644
 --- a/src/openpi/models/model.py
 +++ b/src/openpi/models/model.py
-@@ -162,6 +162,8 @@ def preprocess_observation(
+@@ -162,6 +162,9 @@ def preprocess_observation(
      train: bool = False,
      image_keys: Sequence[str] = IMAGE_KEYS,
      image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 +    wrist_aug_crop: float = 1.0,
 +    wrist_aug_rotate_deg: float = 0.0,
++    wrist_aug_noise: float = 0.0,
  ) -> Observation:
      """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
      filling in a default image mask (if necessary).
-@@ -184,13 +186,24 @@ def preprocess_observation(
+@@ -184,19 +187,38 @@ def preprocess_observation(
              image = image / 2.0 + 0.5
  
              transforms = []
@@ -37,20 +38,36 @@ index 03cd3a7..6d34a9e 100644
              transforms += [
                  augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
              ]
+-            sub_rngs = jax.random.split(rng, image.shape[0])
++            key_rng = jax.random.fold_in(rng, sum(ord(ch) for ch in key))  # 确定性，仅用于让各相机的随机源互相独立
++            sub_rngs = jax.random.split(key_rng, image.shape[0])
+             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+ 
++            if "wrist" in key and wrist_aug_noise > 0.0:
++                # 逐样本随机 sigma，避免模型学到固定噪声水平
++                s_rng, n_rng = jax.random.split(jax.random.fold_in(key_rng, 1))
++                sigma = jax.random.uniform(s_rng, (image.shape[0], 1, 1, 1),
++                                           minval=0.0, maxval=wrist_aug_noise)
++                image = jnp.clip(image + sigma * jax.random.normal(n_rng, image.shape), 0.0, 1.0)
++
+             # Back to [-1, 1].
+             image = image * 2.0 - 1.0
+ 
 diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
-index 140d317..de8f065 100644
+index 140d317..3e51ec1 100644
 --- a/src/openpi/models/pi0.py
 +++ b/src/openpi/models/pi0.py
-@@ -87,6 +87,8 @@ class Pi0(_model.BaseModel):
+@@ -87,6 +87,9 @@ class Pi0(_model.BaseModel):
          super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
          self.pi05 = config.pi05
          self.use_dino_subgoal = config.use_dino_subgoal
 +        self.wrist_aug_crop = config.wrist_aug_crop
 +        self.wrist_aug_rotate_deg = config.wrist_aug_rotate_deg
++        self.wrist_aug_noise = config.wrist_aug_noise
          self.dino_latent_dim = config.dino_latent_dim
          self.dino_world_loss_weight = config.dino_world_loss_weight
          paligemma_config = _gemma.get_config(config.paligemma_variant)
-@@ -251,7 +253,13 @@ class Pi0(_model.BaseModel):
+@@ -251,7 +254,14 @@ class Pi0(_model.BaseModel):
          self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
      ) -> at.Float[at.Array, "*b ah"]:
          preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
@@ -61,15 +78,16 @@ index 140d317..de8f065 100644
 +            train=train,
 +            wrist_aug_crop=self.wrist_aug_crop,
 +            wrist_aug_rotate_deg=self.wrist_aug_rotate_deg,
++            wrist_aug_noise=self.wrist_aug_noise,
 +        )
  
          dino_subgoal = None
          if self.use_dino_subgoal:
 diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
-index a93c9c8..962232d 100644
+index a93c9c8..2b1d6fb 100644
 --- a/src/openpi/models/pi0_config.py
 +++ b/src/openpi/models/pi0_config.py
-@@ -36,6 +36,12 @@ class Pi0Config(_model.BaseModelConfig):
+@@ -36,6 +36,16 @@ class Pi0Config(_model.BaseModelConfig):
      dino_predictor_hidden_dim: int = 512
      dino_world_loss_weight: float = 0.1
  
@@ -78,6 +96,10 @@ index a93c9c8..962232d 100644
 +    # wrist_aug_rotate_deg>0 时额外随机旋转 ±该角度。
 +    wrist_aug_crop: float = 1.0
 +    wrist_aug_rotate_deg: float = 0.0
++    # 腕相机高斯噪声增强：每样本从 [0, 该值] 均匀取 sigma（图像已归一到 [0,1]）。
++    # 依据：评测帧在停滞点加噪 sigma=20/255 可恢复约 2/3 的前进驱动力，
++    # 说明模型抓住了细微外观结构并据此刹车；噪声增强让它不再依赖这些结构。
++    wrist_aug_noise: float = 0.0
 +
      # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
      discrete_state_input: bool = None  # type: ignore

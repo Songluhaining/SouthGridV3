@@ -407,12 +407,23 @@ def prepare_orcalab_cameras(mcp_url: str) -> bool:
     return proc.returncode == 0
 
 
+# 采集脚本从不调用 env.render()，评测原本每个控制步都调一次。render 会触发一次视口渲染，
+# 若渲染管线与相机采集共享状态（时间抗锯齿历史、帧缓冲、渲染次序），流出的相机图就会与采集不同。
+# --no_render 用于验证这一点；一旦证实，应当与采集保持一致（不渲染）。
+_NO_RENDER = False
+
+
+def _render(env) -> None:
+    if not _NO_RENDER:
+        env.render()
+
+
 def hold_target(manager, env, device, action: dict, steps: int, sleep_s: float = 0.0):
     """保持末端目标运行 steps 个控制步（起点稳定 / 相机预热）。"""
     for _ in range(max(0, steps)):
         device.set_target(**action)
         env.step(manager.run_controllers())
-        env.render()
+        _render(env)
         if sleep_s > 0:
             time.sleep(sleep_s)
 
@@ -536,6 +547,10 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="评估集数")
     parser.add_argument("--camera_warmup_steps", type=int, default=10,
                         help="每集推理前相机预热步数（默认 10）")
+    parser.add_argument("--no_render", action="store_true",
+                        help="不调用 env.render()，与采集脚本一致（采集从不 render）")
+    parser.add_argument("--dump_every", type=int, default=0,
+                        help="每隔 N 个动作块把观测与状态存进 --dump_dir（诊断停滞点用）")
     parser.add_argument("--diag_skip_set_ctrl", action="store_true",
                         help="跳过 env.set_ctrl(manager.ctrl)，与采集脚本一致")
     parser.add_argument("--no_default_joints", action="store_true",
@@ -587,6 +602,10 @@ def main():
     )
     args = parser.parse_args()
 
+    global _NO_RENDER
+    _NO_RENDER = bool(args.no_render)
+    if args.no_render:
+        orca_logger.info("[诊断] 已关闭 env.render()，与采集脚本一致")
     if args.max_steps < 1:
         parser.error("--max_steps must be >= 1")
     if args.action_repeat < 1:
@@ -698,7 +717,7 @@ def main():
             env.mj_forward()
             for controller in manager.controllers:
                 controller.reset()
-            env.render()
+            _render(env)
             # 位标志会被 model 重载冲掉：每集强制重设并验证（position 伺服组复活会与 OSC 对抗）
             env.disable_actuator([agent_conf.positions_group])
             _dis = int(env.gym._mjModel.opt.disableactuator)
@@ -844,6 +863,9 @@ def main():
                             f"末步目标 {np.round(action_chunk[-1, 7:10], 3).tolist()}"
                             f" 右爪 {np.round(action_chunk[-1, 16:18], 2).tolist()}"
                             f" 非有限值 {int((~np.isfinite(action_chunk)).sum())}")
+                        if args.dump_every > 0 and args.dump_dir:
+                            _ci = globals().setdefault("_DUMP_CHUNK_I", 0)
+                            globals()["_DUMP_CHUNK_I"] = _ci + 1
                         if args.dump_dir:
                             os.makedirs(args.dump_dir, exist_ok=True)
                             for _k, _img in policy_runner.build_observation(state)["images"].items():
@@ -856,7 +878,7 @@ def main():
                             # 若仍偏 -> 偏移来自取图链路本身。会破坏本集，仅用于诊断。
                             if args.diag_teleport_dump:
                                 teleport_to_ready(env)
-                                env.render()
+                                _render(env)
                                 _log_arm_q(env, "诊断瞬移后")
                                 _st2 = storage.build_state(storage.obs_callback(env))
                                 orca_logger.info(f"[诊断] 瞬移后右手 ee={np.round(_st2[7:10], 4).tolist()}")
@@ -864,6 +886,18 @@ def main():
                                     cv2.imwrite(os.path.join(args.dump_dir, f"tp_{_k}.png"),
                                                 cv2.cvtColor(np.transpose(_img, (1, 2, 0)), cv2.COLOR_RGB2BGR))
                                 orca_logger.info("[诊断] 瞬移帧已保存")
+
+                    if args.dump_every > 0 and args.dump_dir:
+                        _n = globals().get("_DUMP_N", 0)
+                        globals()["_DUMP_N"] = _n + 1
+                        if _n % args.dump_every == 0:
+                            os.makedirs(args.dump_dir, exist_ok=True)
+                            _tag = f"{seg_targets[0] if seg_targets else 'x'}_{_n:03d}"
+                            for _k, _img in policy_runner.build_observation(state)["images"].items():
+                                cv2.imwrite(os.path.join(args.dump_dir, f"{_tag}_{_k}.png"),
+                                            cv2.cvtColor(np.transpose(_img, (1, 2, 0)), cv2.COLOR_RGB2BGR))
+                            np.save(os.path.join(args.dump_dir, f"{_tag}_state.npy"), np.asarray(state))
+                            orca_logger.info(f"[dump] {_tag} ee={np.round(np.asarray(state)[7:10],4).tolist()}")
 
                     for model_action in action_chunk:
                         if step >= seg_end or truncated or seg_done or _interrupt.is_set():
@@ -887,7 +921,7 @@ def main():
                                     button_monitor.obs[c]["hit_step"] is not None for c in seg_targets):
                                 seg_done = True
                             _pt2 = time.perf_counter()
-                            env.render()
+                            _render(env)
                             _pt3 = time.perf_counter()
 
                             # 实时预览（复用同一套内存流相机）
@@ -1024,7 +1058,7 @@ def main():
                 if device is not None:
                     action = manager.run_controllers()
                     env.step(action)
-                env.render()
+                _render(env)
                 time.sleep(0.05)
 
     finally:
@@ -1047,7 +1081,7 @@ def main():
                 pass
         try:
             scene_manager.show_ui_message(1, "", showtime=0)
-            env.render()
+            _render(env)
         except Exception:
             orca_logger.warning("界面状态清理未完成")
         try:
