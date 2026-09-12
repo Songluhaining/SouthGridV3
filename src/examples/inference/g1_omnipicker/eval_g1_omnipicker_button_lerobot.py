@@ -461,6 +461,63 @@ def build_default_joint_values() -> dict:
     return d
 
 
+# 该机器人是轮式浮动基座（free_joint + 4 个轮子 + 转向），不是刚性挂载。
+# 采集在瞬移后立刻录第 0 帧（0 个物理步），评测则先跑 drive_to_ready 的 800 个物理步，
+# 手臂的反作用力把整台车推移约 12mm / 转约 1°，车上所有相机随之偏 4~5 像素——
+# 而策略对腕相机视角零容差。这里把基座与轮子恢复到瞬移时的标称值，令首帧观测回到训练分布。
+_BASE_JOINT_KEYS = ("free_joint", "wheel_")
+
+
+def _snap_base_q(env) -> dict:
+    try:
+        names = [n for n in env.model.get_joint_dict()
+                 if any(k in n for k in _BASE_JOINT_KEYS)]
+        cur = env.query_joint_qpos(names)
+        return {n: np.array(np.ravel(cur[n]), dtype=np.float64).copy() for n in names if n in cur}
+    except Exception as e:
+        orca_logger.warning(f"[基座] 快照失败: {e}")
+        return {}
+
+
+def _restore_base(env, snap: dict) -> None:
+    if not snap:
+        return
+    try:
+        env.set_joint_qpos({n: v for n, v in snap.items()})
+        env.mj_forward()
+        orca_logger.info(f"[基座] 已恢复 {len(snap)} 个基座/轮子关节到瞬移时的标称值")
+    except Exception as e:
+        orca_logger.warning(f"[基座] 恢复失败: {e}")
+
+
+def _snap_all_q(env) -> dict:
+    """全部关节角快照（诊断非手臂关节的重力沉降）。"""
+    try:
+        import numpy as _np
+        names = list(env.model.get_joint_dict().keys())
+        cur = env.query_joint_qpos(names)
+        return {n: _np.ravel(cur[n]).astype(float).copy() for n in names if n in cur}
+    except Exception as _e:
+        orca_logger.warning(f"[沉降] 快照失败: {_e}")
+        return {}
+
+
+def _diff_all_q(a: dict, b: dict, tag: str, topn: int = 60) -> None:
+    import numpy as _np
+    rows = []
+    for n, va in a.items():
+        vb = b.get(n)
+        if vb is None or vb.shape != va.shape or va.size == 0:
+            continue
+        d = float(_np.max(_np.abs(vb - va)))
+        if d > 0:
+            rows.append((d, n))
+    rows.sort(reverse=True)
+    orca_logger.info(f"[沉降] {tag}: 共 {len(rows)} 个关节发生变化，最大的 {topn} 个（度 / 米）:")
+    for d, n in rows[:topn]:
+        orca_logger.info(f"[沉降]    {n}  |Δ| = {d:.6f}  ({_np.degrees(d):.3f}°)")
+
+
 def _log_arm_q(env, tag: str) -> None:
     """打印右臂关节角与标称预备位形的逐关节偏差（零空间漂移诊断）。"""
     try:
@@ -547,6 +604,12 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="评估集数")
     parser.add_argument("--camera_warmup_steps", type=int, default=10,
                         help="每集推理前相机预热步数（默认 10）")
+    parser.add_argument("--legacy_default_joints", action="store_true",
+                        help="构造 manager 时就传默认关节角（旧行为，仅对照用）")
+    parser.add_argument("--restore_pose", action="store_true",
+                        help="预备位稳定后把全部关节恢复到瞬移时的快照（与采集首帧逐位一致），并按恢复后的实测位姿重设 OSC 目标")
+    parser.add_argument("--restore_base", action="store_true",
+                        help="预备位稳定后把浮动基座与轮子恢复到瞬移时的标称值（与采集首帧同分布）")
     parser.add_argument("--no_render", action="store_true",
                         help="不调用 env.render()，与采集脚本一致（采集从不 render）")
     parser.add_argument("--dump_every", type=int, default=0,
@@ -629,7 +692,9 @@ def main():
         agent_name="g1_omnipicker",
         env_name="DataCollection",
         entry_point=ENTRY_POINT,
-        default_joint_values=build_default_joint_values(),
+        # 与采集脚本一致：构造时传空，等 update_scene() 重载模型后再设。
+        # 构造时传入会改变 OrcaLab 导出模型的参考位形，导致同一组关节角对应不同物理位姿。
+        default_joint_values={} if not args.legacy_default_joints else build_default_joint_values(),
         obs_callback=storage.obs_callback,
         env_index=0,
         device=None,
@@ -708,6 +773,9 @@ def main():
             if args.start_pose == "ready":
                 teleport_to_ready(env)
                 _log_arm_q(env, "瞬移后(应为0)")
+                _Q_AFTER_TELEPORT = _snap_all_q(env)
+                globals()["_BASE_SNAP"] = _snap_base_q(env)
+                globals()["_Q_TP"] = _Q_AFTER_TELEPORT
             l_arm, r_arm, l_grip, r_grip = build_controllers(manager, env)
             manager.set_init_ctrl()
             # manager.ctrl 只有手臂/夹爪下标被 set_init_ctrl 填过，腿部与腰部仍是 0；
@@ -806,6 +874,28 @@ def main():
                     _ready_apply = drive_to_ready(manager, env, device, _init_action_apply,
                                                   args.ready_move_steps, args.settle_steps)
                 _log_arm_q(env, f"预备位({args.ready_mode})后")
+                if args.restore_pose:
+                    # 采集的第 0 帧 = 瞬移后立刻录，0 个物理步。评测跑完 drive_to_ready 后
+                    # 基座被推移、手臂落在另一个冗余解上，两路相机都偏离训练分布。
+                    # 这里整体恢复到瞬移快照，并用恢复后的实测位姿重设 OSC 目标，避免首步跳变。
+                    _snap = globals().get("_Q_TP") or {}
+                    if _snap:
+                        try:
+                            env.set_joint_qpos({n: v for n, v in _snap.items()})
+                            env.mj_forward()
+                            _st_r = storage.build_state(storage.obs_callback(env))
+                            _ready_apply = action_dict_for_apply(parse_policy_action(_st_r))
+                            device.set_target(**_ready_apply)
+                            orca_logger.info(
+                                f"[恢复] 全部 {len(_snap)} 个关节已回到瞬移快照；"
+                                f"右手 ee={np.round(_st_r[7:10], 4).tolist()}")
+                        except Exception as _e:
+                            orca_logger.warning(f"[恢复] 失败: {_e}")
+                elif args.restore_base:
+                    _restore_base(env, globals().get("_BASE_SNAP") or {})
+                _qtp = globals().get("_Q_TP")
+                if _qtp:
+                    _diff_all_q(_qtp, _snap_all_q(env), "瞬移后 -> 预备位稳定后")
                 _start_state = storage.build_state(storage.obs_callback(env))
                 _start_err = float(np.linalg.norm(_start_state[7:10] - _ready_apply["r_pos_b"]))
                 _start_ang = float(np.degrees((R.from_quat(_start_state[10:14])

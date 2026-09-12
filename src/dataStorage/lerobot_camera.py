@@ -279,7 +279,28 @@ def capture_frame_with_idx(
             frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
         images[key] = np.ascontiguousarray(frame, dtype=np.uint8)
         indices[env_name] = idx
+    _maybe_dump_raw(images)
     return images, indices
+
+
+# 诊断用：把编码前的原始帧存成 PNG。评测送给策略的是未压缩帧，训练读的是 mp4 解码帧，
+# 两者若差得多，说明域偏移来自视频编解码往返。置环境变量 RAW_FRAME_DUMP=<目录> 开启。
+_RAW_DUMP_N = 0
+
+
+def _maybe_dump_raw(images: dict) -> None:
+    global _RAW_DUMP_N
+    d = os.environ.get("RAW_FRAME_DUMP")
+    if not d:
+        return
+    limit = int(os.environ.get("RAW_FRAME_DUMP_LIMIT", "12"))
+    if _RAW_DUMP_N >= limit:
+        return
+    os.makedirs(d, exist_ok=True)
+    for key, img in images.items():
+        cv2.imwrite(os.path.join(d, f"raw_{_RAW_DUMP_N:04d}_{key}.png"),
+                    cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    _RAW_DUMP_N += 1
 
 
 def probe_camera_hw(cameras: dict, camera_map: dict, default_hw: tuple = DEFAULT_HW) -> tuple:
