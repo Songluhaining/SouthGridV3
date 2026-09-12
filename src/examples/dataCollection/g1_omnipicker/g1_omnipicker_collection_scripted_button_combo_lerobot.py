@@ -359,20 +359,41 @@ def build_combo_segments(
     # v2 前导段：从当前位置走到 ready 预备位姿（此段不录制，见 pre_roll）
     # 左爪显式钉在 conf 的 init_ctrl：build_segmented_trajectory 的夹爪初值是 g_open，
     # 而本任务左爪全程 "hold"，不显式给值就会被一路指令张开（实测左爪转了 29°）。
+    # 预备位姿抖动：v6 的首帧位姿跨集标准差是 0.001mm（等于零），模型因此对起点零容差。
+    ready_pos = READY_R_POS_B.copy()
+    ready_quat = list(READY_R_QUAT_B)
+    _rj_m = float(getattr(args, "ready_jitter_mm", 0.0)) / 1000.0
+    _rj_d = float(getattr(args, "ready_jitter_deg", 0.0))
+    if _rj_m > 0:
+        ready_pos = ready_pos + np.array([rng.gauss(0, _rj_m / 2) for _ in range(3)]).clip(-_rj_m, _rj_m)
+    if _rj_d > 0:
+        ready_quat = list(_jitter_quat_xyzw(ready_quat, rng, max_deg=_rj_d))
+
+    # 收敛保持段的长度随机化：预备位的画面是一段整定暂态，与训练首帧的距离随该值
+    # 呈 V 形（实测 settle=0 时 46、145 时谷底 13、290 时 21）。v6 固定 150 步，
+    # 800 集全部卡在同一相位上；评测因推理延迟必然落在别的相位，无法对齐。
+    # 随机化该长度即把暂态的多个相位采进训练集。
+    _sj = getattr(args, "settle_jitter", "")
+    if _sj:
+        _lo, _hi = (int(x) for x in str(_sj).split(","))
+        settle_steps = rng.randint(min(_lo, _hi), max(_lo, _hi))
+    else:
+        settle_steps = 150
+
     segments.append({
         "steps": READY_STEPS, "l_hold": True,
-        "r_target_b": READY_R_POS_B.tolist(), "r_quat_b": READY_R_QUAT_B.tolist(),
+        "r_target_b": ready_pos.tolist(), "r_quat_b": list(ready_quat),
         "gripper_l": LEFT_GRIP_HOLD, "gripper_r": g_close,
     })
     # 收敛保持段：目标钉在 ready，等 OSC 稳态后再开始正式轨迹
     segments.append({
-        "steps": 150, "l_hold": True,
-        "r_target_b": READY_R_POS_B.tolist(), "r_quat_b": READY_R_QUAT_B.tolist(),
+        "steps": settle_steps, "l_hold": True,
+        "r_target_b": ready_pos.tolist(), "r_quat_b": list(ready_quat),
         "gripper_l": "hold", "gripper_r": g_close,
     })
-    t += READY_STEPS + 150
+    t += READY_STEPS + settle_steps
     pre_roll = t
-    cursor = READY_R_POS_B.copy()
+    cursor = ready_pos.copy()
 
     for color in seq_colors:
         btn = buttons[color]
@@ -719,6 +740,13 @@ def main() -> None:
                              "给出后按压路径从档案精英均匀采样，替代内置弯曲随机")
     parser.add_argument("--elite_top_frac", type=float, default=1.0,
                         help="每色只保留 fitness 最优的前 N 比例精英（0~1，1 为全部）")
+    parser.add_argument("--settle_jitter", type=str, default="",
+                        help="收敛保持段步数的随机范围，如 60,250。留空则固定 150（v6 行为）。"
+                             "用于把预备位整定暂态的多个相位采进训练集")
+    parser.add_argument("--ready_jitter_mm", type=float, default=0.0,
+                        help="预备位姿位置抖动上限（毫米）；v6 为 0，导致首帧位姿跨集标准差 0.001mm")
+    parser.add_argument("--ready_jitter_deg", type=float, default=0.0,
+                        help="预备位姿姿态抖动上限（度）")
     parser.add_argument("--jitter", type=float, default=1.0,
                         help="轨迹随机化总强度，0 关闭全部随机化，1 为默认强度")
     parser.add_argument("--canonical_ratio", type=float, default=0.34,
