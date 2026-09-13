@@ -219,3 +219,7 @@ TODO.md
 
 # 交付指南 PDF 标注「禁止扩散传播」，不入库
 *.pdf
+
+# 评分服务运行时产物（本地存储 / 屏幕录像）
+.orca_comp_scorer/
+recordings/
