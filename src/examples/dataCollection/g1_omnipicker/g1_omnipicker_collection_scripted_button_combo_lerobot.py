@@ -781,6 +781,11 @@ def main() -> None:
                         help="前推目标越过瞄准点的深度(米)。默认：proximity 模式 0.010，press 模式 0.040")
     parser.add_argument("--max_consec_fail", type=int, default=3,
                         help="连续多少集按压全败即停止（场景漂移信号：按压反作用力会累计推远基座与电柜，需重启仿真）")
+    parser.add_argument("--grip_r_approach", type=float, default=None,
+                        help="接近/按压全程右爪的开合值（执行器量纲，-1.0 全开 ~ 2.0 全闭）。"
+                             "默认 None = 沿用候选位姿里的闭合值。张开后两指分居按钮帽两侧，"
+                             "帽子可从中间穿过，ee_center_site_r 能越过 45mm 的指尖前伸量——"
+                             "闭合时官方距离被接触钉死在 70mm，够不到得分曲线 50mm 的顶点。")
     parser.add_argument("--contact_offset", type=str, default="0,0",
                         help="调试/标定用：给所有接触位姿加固定偏移 dy,dz（米），如 -0.008,0")
     parser.add_argument("--max_site_dist", type=float, default=0.080,
@@ -816,6 +821,10 @@ def main() -> None:
         cand_spec = safe_load(f)
     g_open = float(cand_spec.get("gripper_open", -0.8561))
     g_close = float(cand_spec.get("gripper_close", 2.0))
+    # 段内右爪开合：build_combo_segments 的每一段都用这个值（含预备段）。
+    _g_r_seg = g_close if args.grip_r_approach is None else float(args.grip_r_approach)
+    if args.grip_r_approach is not None:
+        orca_logger.info(f"[夹爪] 接近全程右爪开合 = {_g_r_seg}（默认闭合 {g_close}）")
     approach_back = float(cand_spec.get("approach_back", 0.12))
     buttons: dict = cand_spec["buttons"]
 
@@ -915,17 +924,41 @@ def main() -> None:
         _braw = mujoco.mj_name2id(_mj_m, mujoco.mjtObj.mjOBJ_BODY, _bname)
         _gid = next(g for g in range(_mj_m.ngeom) if _mj_m.geom_bodyid[g] == _braw)
         _joint_caps[_jn] = (_gid, _cap_pos_B(_gid))
+    # 颜色→按钮的映射以官方 configs/tasks.yaml 为准（red→button01、green→button02、
+    # blue→button03、yellow→button04），评分服务就是按这张表取 target_button_site。
+    # 旧实现只做候选位姿的 y-z 最近邻匹配，没有一一对应约束：帽心是在基座系里算的，
+    # 只要底盘相对标称位姿偏了（残留评测进程会留下几十毫米的漂移），整个电柜在基座系
+    # 里平移，蓝色就会连同绿色一起命中 button02——而且静默通过。实测偏 66mm 即复现。
+    _OFFICIAL_BUTTON = {"red": "button01", "green": "button02",
+                        "blue": "button03", "yellow": "button04"}
     color2joint: dict[str, str] = {}
     color2cap: dict[str, int] = {}
     for _color, _spec in buttons.items():
         _mean = np.mean([c["r_target_b"] for c in _spec["candidates"]], axis=0)
-        _jn = min(_joint_caps,
-                  key=lambda k: float(np.linalg.norm(_joint_caps[k][1][1:] - _mean[1:])))
+        _near = min(_joint_caps,
+                    key=lambda k: float(np.linalg.norm(_joint_caps[k][1][1:] - _mean[1:])))
+        _want = _OFFICIAL_BUTTON.get(_color)
+        _jn = next((k for k in _joint_caps
+                    if _want is not None and k.split("_")[-2].lower() == _want), None)
+        if _jn is None:
+            orca_logger.warning(
+                f"[标定] 场景里没有 {_want}，{_COLOR_CN[_color]} 回退到几何最近邻")
+            _jn = _near
+        elif _jn != _near:
+            orca_logger.warning(
+                f"[标定] {_COLOR_CN[_color]} 官方映射为 {_want}，几何最近邻却是 "
+                f"{_near.split('_')[-2]}——电柜相对候选位姿有偏移（多半是底盘没回标称位姿），"
+                f"以官方映射为准")
         color2joint[_color] = _jn
         color2cap[_color] = _joint_caps[_jn][0]
         orca_logger.info(
             f"[标定] {_COLOR_CN[_color]} → {_jn.split('_')[-2]} "
             f"帽心 B={_joint_caps[_jn][1].round(4).tolist()}")
+    # 一一对应自检：两个颜色映射到同一个按钮会让该色的整批数据瞄错，必须当场退出。
+    if len(set(color2joint.values())) != len(color2joint):
+        orca_logger.error(f"[标定] 颜色→按钮不是一一对应: {color2joint}，退出")
+        env.close()
+        return
     _robot_geom_ids = [
         g for g in range(_mj_m.ngeom)
         if "g1_omnipicker" in (mujoco.mj_id2name(_mj_m, mujoco.mjtObj.mjOBJ_BODY,
@@ -1096,7 +1129,7 @@ def main() -> None:
                 l_arm, r_arm, l_grip, r_grip = build_controllers()
                 segments, windows, press_params, pre_roll = build_combo_segments(
                     seq, buttons, lambda c: _cap_pos_B(color2cap[c]), _site_pos_B,
-                    _query_r_start(), approach_back, g_close, args, rng, bins,
+                    _query_r_start(), approach_back, _g_r_seg, args, rng, bins,
                     archive=traj_archive)
                 l_pos, l_quat, r_pos, r_quat_traj, l_gm, r_gm = scripted.build_segmented_trajectory(
                     env, agent_conf, segments, g_open, g_close)
