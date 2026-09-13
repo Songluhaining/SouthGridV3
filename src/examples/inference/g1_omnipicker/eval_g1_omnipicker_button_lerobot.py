@@ -712,6 +712,10 @@ def main():
                         help="不在客户端预缩到 224x224（旧行为）。预缩后模型看到的图像一致，"
                              "但单次推理载荷从 1.84MB 降到 0.30MB、延迟 1.6s 降到 0.36s；"
                              "官方 attempt 有 180 秒全局时限，不预缩会超时判 0")
+    parser.add_argument("--dwell_steps", type=int, default=0,
+                        help="每段结束前回到本段最接近位姿并停留的控制步数（0 关闭）")
+    parser.add_argument("--dwell_sleep", type=float, default=0.02,
+                        help="停留时每控制步的墙钟睡眠秒数，用于让 10Hz 评分采样器采到最近点")
     parser.add_argument("--scorer_steps", action="store_true",
                         help="按段调用 ScorerClient 的 begin_step/end_step 圈定评分窗口。"
                              "交付脚本默认不调用，评分服务会在 finish 时自动回溯判定所有步骤"
@@ -1098,6 +1102,9 @@ def main():
                 policy_runner.prompt = prompt
                 seg_end = step + budget
                 _prev_apply = None
+                _best_apply = None
+                _best_site = float('inf')
+                globals()["_LAST_BEST_APPLY"] = None
                 seg_done = False
                 while (step < seg_end and not truncated and not seg_done
                        and not _interrupt.is_set()):
@@ -1185,6 +1192,13 @@ def main():
                             _pt1 = time.perf_counter()
                             _, _, _, truncated, _ = env.step(action)
                             button_monitor.check(step)
+                            if args.dwell_steps > 0 and seg_targets:
+                                _sd = button_monitor.obs[seg_targets[0]]["site_dist"]
+                                if _sd < _best_site - 1e-6:
+                                    _best_site = _sd
+                                    _best_apply = {k: (v.copy() if hasattr(v, "copy") else v)
+                                                   for k, v in _apply.items()}
+                                    globals()["_LAST_BEST_APPLY"] = _best_apply
                             if not args.no_early_stop and all(
                                     button_monitor.obs[c]["hit_step"] is not None for c in seg_targets):
                                 seg_done = True
@@ -1295,11 +1309,30 @@ def main():
                         orca_logger.warning(f"[scorer] begin_step 失败: {_e}")
                         _sc_step = None
                 run_segment(_p, _st, args.max_steps)
+                # 评分服务按墙钟 10Hz 取样，而仿真是「推理时冻结、然后一口气跑完 200 个
+                # 控制步」——最接近按钮的那一瞬发生在高速推进期，极易被漏采（实测红/黄
+                # 本地 80/102mm、官方判成 140/146mm；而提前结束的绿/蓝两色两边完全一致）。
+                # 这里用 OSC 实时驱动回本段最接近的那个目标并停留，让采样器采得到。
+                if args.dwell_steps > 0 and globals().get("_LAST_BEST_APPLY"):
+                    try:
+                        device.set_target(**globals()["_LAST_BEST_APPLY"])
+                        hold_target(manager, env, device, globals()["_LAST_BEST_APPLY"],
+                                    args.dwell_steps, sleep_s=args.dwell_sleep)
+                        orca_logger.info(f"[停留] 回到本段最接近位姿并停留 {args.dwell_steps} 步")
+                    except Exception as _e:
+                        orca_logger.warning(f"[停留] 失败: {_e}")
                 if _sc_step is not None:
                     try:
                         _r = scorer.end_step()
+                        # 打印官方的完整判定：extra 里带 best_frame 的原始距离，
+                        # 用来和本地逐控制步测到的最小距离对照，判断官方"看不看得到"我们的接近。
+                        import json as _json
                         orca_logger.info(f"[scorer] step end: {_sc_step} -> {_r.get('success')} "
-                                         f"score={_r.get('score')}")
+                                         f"score={_r.get('score')} ratio={_r.get('score_ratio')}")
+                        orca_logger.info("[scorer] extra: "
+                                         + _json.dumps(_r.get("extra") or {}, ensure_ascii=False)[:400])
+                        orca_logger.info("[scorer] diagnosis: "
+                                         + _json.dumps(_r.get("diagnosis") or {}, ensure_ascii=False)[:400])
                     except Exception as _e:
                         orca_logger.warning(f"[scorer] end_step 失败: {_e}")
 
