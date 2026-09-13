@@ -495,6 +495,33 @@ def build_default_joint_values() -> dict:
 _BASE_JOINT_KEYS = ("free_joint", "wheel_")
 
 
+def _verify_ready(manager, env, device, storage, ref_state, base_snap, args):
+    """每段按压前核对基座与手臂是否回到了本集第 1 段的起始位姿，不对就纠正后重查。
+
+    本方案的前提是"每段独立地从同一预备位姿开始"。但这台机器人是轮式浮动基座，
+    段间回位只伺服手臂、不管车，四段累积下来相机视角越偏越多（实测黄色作为第 4 段
+    停在 163mm，单独跑只有 87mm）。这里显式核对并纠正，让该前提真正成立。
+    """
+    tol_m = args.ready_tol_mm / 1000.0
+    tol_deg = args.ready_tol_deg
+    for attempt in range(max(1, args.ready_max_tries)):
+        _restore_base(env, base_snap)
+        st = storage.build_state(storage.obs_callback(env))
+        d_mm = float(np.linalg.norm(st[7:10] - ref_state[7:10])) * 1000.0
+        d_deg = float(np.degrees((R.from_quat(st[10:14]) * R.from_quat(ref_state[10:14]).inv()).magnitude()))
+        if d_mm <= args.ready_tol_mm and d_deg <= tol_deg:
+            if attempt:
+                orca_logger.info(f"[核对] 第 {attempt} 次纠正后达标：偏差 {d_mm:.1f}mm / {d_deg:.2f}°")
+            return st
+        orca_logger.info(f"[核对] 偏差 {d_mm:.1f}mm / {d_deg:.2f}°（容差 {args.ready_tol_mm}mm / {tol_deg}°），纠正中")
+        _cur = action_dict_for_apply(parse_policy_action(st))
+        drive_to_ready(manager, env, device, _cur, args.return_move_steps, args.return_settle_steps)
+    st = storage.build_state(storage.obs_callback(env))
+    d_mm = float(np.linalg.norm(st[7:10] - ref_state[7:10])) * 1000.0
+    orca_logger.warning(f"[核对] 纠正 {args.ready_max_tries} 次后仍偏差 {d_mm:.1f}mm，继续执行")
+    return st
+
+
 def _snap_base_q(env) -> dict:
     try:
         names = [n for n in env.model.get_joint_dict()
@@ -621,7 +648,7 @@ def main():
     parser.add_argument("--return_move_steps", type=int, default=600,
                         help="两条指令之间回预备位姿的插值步数。官方 P2 规则要求四钮最佳帧跨度 >20s，"
                              "按压约 4.2s/次时回位需 >2.5s(500步)，默认 500 留余量")
-    parser.add_argument("--return_settle_steps", type=int, default=200,
+    parser.add_argument("--return_settle_steps", type=int, default=145,
                         help="回到预备位姿后钉住目标等 OSC 收敛的控制步数")
     parser.add_argument("--sleep", action="store_true", help="按 real_time_step 节奏运行")
     parser.add_argument("--max_steps", type=int, default=6000,
@@ -631,6 +658,9 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="评估集数")
     parser.add_argument("--camera_warmup_steps", type=int, default=10,
                         help="每集推理前相机预热步数（默认 10）")
+    parser.add_argument("--interp_actions", action="store_true",
+                        help="把动作块插值成每控制步一个路点，复现采集的 200Hz 连续驱动；"
+                             "评测默认是每 action_repeat 步跳一次的阶梯目标")
     parser.add_argument("--diag_hold_dump", type=int, default=0,
                         help="诊断：预备位静止时连拍 N 张（每张间隔 --diag_hold_gap 个控制步）后退出")
     parser.add_argument("--diag_hold_gap", type=int, default=20,
@@ -639,6 +669,12 @@ def main():
                         help="不锁左爪（旧行为，仅对照用）；采集脚本是锁的")
     parser.add_argument("--legacy_default_joints", action="store_true",
                         help="构造 manager 时就传默认关节角（旧行为，仅对照用）")
+    parser.add_argument("--verify_ready", action="store_true",
+                        help="每段按压前核对基座与手臂是否回到本集第 1 段的起始位姿，不对就纠正后重查")
+    parser.add_argument("--ready_tol_mm", type=float, default=12.0,
+                        help="核对的位置容差（毫米）。OSC 对预备位的稳态误差本就有 7~10mm，定太紧会导致每段都做无谓纠正，而每次纠正的 745 个控制步又会把基座推挪一遍")
+    parser.add_argument("--ready_tol_deg", type=float, default=3.5, help="核对的姿态容差（度）")
+    parser.add_argument("--ready_max_tries", type=int, default=3, help="最多纠正几次")
     parser.add_argument("--restore_pose", action="store_true",
                         help="预备位稳定后把全部关节恢复到瞬移时的快照（与采集首帧逐位一致），并按恢复后的实测位姿重设 OSC 目标")
     parser.add_argument("--restore_base", action="store_true",
@@ -1008,6 +1044,7 @@ def main():
                 nonlocal step, truncated
                 policy_runner.prompt = prompt
                 seg_end = step + budget
+                _prev_apply = None
                 seg_done = False
                 while (step < seg_end and not truncated and not seg_done
                        and not _interrupt.is_set()):
@@ -1065,9 +1102,27 @@ def main():
 
                         parsed_action = parse_policy_action(model_action)
                         _apply = action_dict_for_apply(parsed_action)
-                        device.set_target(**_apply)
+                        # 采集时 OSC 每个控制步都换一个新路点（200Hz 连续轨迹）；评测原先是设一次
+                        # 目标保持 action_repeat 步（20Hz 阶梯），每次跳变后 OSC 要重新收敛，
+                        # 还没追上就又跳，产生系统性滞后与欠冲。--interp_actions 把动作块插值成
+                        # 每控制步一个路点，复现采集的驱动方式。
+                        _interp = args.interp_actions and _prev_apply is not None
+                        if _interp:
+                            _p0 = np.asarray(_prev_apply["r_pos_b"], dtype=np.float32)
+                            _p1 = np.asarray(_apply["r_pos_b"], dtype=np.float32)
+                            _sl = Slerp([0.0, 1.0], R.from_quat(
+                                [_prev_apply["r_quat_b"], _apply["r_quat_b"]]))
+                        else:
+                            device.set_target(**_apply)
 
-                        for _ in range(args.action_repeat):
+                        _prev_apply = _apply
+                        for _sub_i in range(args.action_repeat):
+                            if _interp:
+                                _a = (_sub_i + 1) / max(1, args.action_repeat)
+                                _sub = dict(_apply)
+                                _sub["r_pos_b"] = (_p0 + (_p1 - _p0) * _a).astype(np.float32)
+                                _sub["r_quat_b"] = _sl(_a).as_quat().astype(np.float32)
+                                device.set_target(**_sub)
                             if step >= seg_end or truncated or seg_done or _interrupt.is_set():
                                 break
 
@@ -1135,8 +1190,20 @@ def main():
                         storage.build_state(storage.obs_callback(env))))
                     _ready_apply = drive_to_ready(manager, env, device, _cur,
                                                   args.return_move_steps, args.return_settle_steps)
+                    # 本方案的设计意图是"每段都从同一预备位姿独立开始"，但回位只伺服手臂，
+                    # 不管基座——这台机器人是轮式浮动基座，每段手臂运动都把整车推挪约 12mm，
+                    # 四段累积下来第 4 段的相机视角偏得最远（实测黄色单独跑 87mm，作为第 4 段 163mm）。
+                    # 这里把基座与轮子也复位，让"独立开始"真正成立。
+                    if args.verify_ready and globals().get("_SEG1_STATE") is not None:
+                        _st_v = _verify_ready(manager, env, device, storage,
+                                              globals()["_SEG1_STATE"],
+                                              globals().get("_BASE_SNAP") or {}, args)
+                    elif args.restore_base or args.restore_pose:
+                        _restore_base(env, globals().get("_BASE_SNAP") or {})
                     device.set_target(**action_dict_for_apply(parse_policy_action(
                         storage.build_state(storage.obs_callback(env)))))
+                if _si == 0:
+                    globals()["_SEG1_STATE"] = storage.build_state(storage.obs_callback(env)).copy()
                 orca_logger.info(f"=== 指令 {_si + 1}/{len(_prompts)}: {_p} ===")
                 run_segment(_p, _st, args.max_steps)
 
