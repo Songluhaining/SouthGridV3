@@ -344,10 +344,12 @@ class CameraObservationBuilder:
         cameras: dict,
         camera_name_map: dict[str, str],
         target_hw: tuple = (480, 640),
+        prescale: bool = True,
     ):
         self.cameras = cameras
         self.camera_name_map = camera_name_map
         self.target_hw = target_hw
+        self.prescale = prescale
 
     def build_images(self) -> dict:
         H, W = self.target_hw
@@ -362,7 +364,15 @@ class CameraObservationBuilder:
                     if frame is None or frame.size == 0:
                         rgb = np.zeros((H, W, 3), dtype=np.uint8)
                     else:
-                        if frame.shape[0] != H or frame.shape[1] != W:
+                        if self.prescale:
+                            # 策略内部本来就会 resize_with_pad 到 224x224，这里用同一个函数
+                            # 先缩好再发：服务端那步变成空操作，模型看到的完全一致，但载荷从
+                            # 1.84MB 降到 0.30MB。官方 attempt 有 180 秒全局时限，而经隧道
+                            # 传原始图每次推理要 1.6 秒（实测 130+ 次推理 = 205 秒，直接超时判 0）；
+                            # 预缩后降到 0.36 秒。
+                            from openpi_client import image_tools as _it
+                            frame = _it.resize_with_pad(frame, 224, 224)
+                        elif frame.shape[0] != H or frame.shape[1] != W:
                             frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
                         rgb = np.ascontiguousarray(frame, dtype=np.uint8)
                 except Exception:
@@ -383,6 +393,7 @@ class OpenPIPolicyRunner:
         cameras: dict,
         target_hw: tuple = (480, 640),
         use_images: bool = True,
+        prescale: bool = True,
     ):
         from openpi_client import websocket_client_policy
 
@@ -395,6 +406,7 @@ class OpenPIPolicyRunner:
                 cameras=cameras,
                 camera_name_map=camera_name_map,
                 target_hw=target_hw,
+                prescale=prescale,
             )
             if use_images
             else None
@@ -538,10 +550,37 @@ def _restore_base(env, snap: dict) -> None:
         return
     try:
         env.set_joint_qpos({n: v for n, v in snap.items()})
+        # 只设位置不清速度的话，基座会带着残余速度在本段内继续漂，
+        # 第 4 段（横向最远的黄色）受累积影响最大。
+        try:
+            env.set_joint_qvel({n: np.zeros(len(np.ravel(v))) for n, v in snap.items()})
+        except Exception as _e:
+            orca_logger.warning(f"[基座] 速度清零失败: {_e}")
         env.mj_forward()
-        orca_logger.info(f"[基座] 已恢复 {len(snap)} 个基座/轮子关节到瞬移时的标称值")
+        orca_logger.info(f"[基座] 已恢复 {len(snap)} 个基座/轮子关节（位置+速度）")
     except Exception as e:
         orca_logger.warning(f"[基座] 恢复失败: {e}")
+
+
+def _restore_seg1(env, snap: dict) -> bool:
+    """把全部关节恢复到本集第 1 段起始时的快照。
+
+    回位只伺服末端，7 自由度冗余臂会落在不同的零空间解上：实测第 2~4 段起点的
+    末端只差约 10mm，但 arm_r_joint1/joint3 差 20~28 度。横向最远的黄色对此最敏感
+    （第 4 段 113mm，单独跑 87mm）。这里按第 1 段的关节快照整体复位，
+    让每段的起始构型逐关节一致。
+    """
+    if not snap:
+        return False
+    try:
+        env.set_joint_qpos({n: v for n, v in snap.items()})
+        env.set_joint_qvel({n: np.zeros(len(np.ravel(v))) for n, v in snap.items()})
+        env.mj_forward()
+        orca_logger.info(f"[复位] 已按第 1 段快照恢复 {len(snap)} 个关节（位置+速度）")
+        return True
+    except Exception as e:
+        orca_logger.warning(f"[复位] 失败: {e}")
+        return False
 
 
 def _snap_all_q(env) -> dict:
@@ -669,6 +708,19 @@ def main():
                         help="不锁左爪（旧行为，仅对照用）；采集脚本是锁的")
     parser.add_argument("--legacy_default_joints", action="store_true",
                         help="构造 manager 时就传默认关节角（旧行为，仅对照用）")
+    parser.add_argument("--no_prescale", action="store_true",
+                        help="不在客户端预缩到 224x224（旧行为）。预缩后模型看到的图像一致，"
+                             "但单次推理载荷从 1.84MB 降到 0.30MB、延迟 1.6s 降到 0.36s；"
+                             "官方 attempt 有 180 秒全局时限，不预缩会超时判 0")
+    parser.add_argument("--scorer_steps", action="store_true",
+                        help="按段调用 ScorerClient 的 begin_step/end_step 圈定评分窗口。"
+                             "交付脚本默认不调用，评分服务会在 finish 时自动回溯判定所有步骤"
+                             "（每色最佳帧在整个 attempt 内搜索，实测官方 31~33 分）；"
+                             "按段圈定后每色只在自己那段取分，实测 22.7 分")
+    parser.add_argument("--restore_seg1", action="store_true",
+                        help="每段开始时把全部关节恢复到第 1 段的快照（逐关节一致，含冗余臂构型）")
+    parser.add_argument("--seg_diag", action="store_true",
+                        help="每段开始时打印与第 1 段的关节/末端差异（诊断累积漂移）")
     parser.add_argument("--verify_ready", action="store_true",
                         help="每段按压前核对基座与手臂是否回到本集第 1 段的起始位姿，不对就纠正后重查")
     parser.add_argument("--ready_tol_mm", type=float, default=12.0,
@@ -928,6 +980,7 @@ def main():
                     cameras=_shared_cameras,
                     target_hw=_target_hw,
                     use_images=not args.no_images,
+                    prescale=not args.no_prescale,
                 )
                 orca_logger.info(f"已连接策略服务器: {args.host}:{args.port}")
                 orca_logger.info("策略服务已就绪")
@@ -1194,7 +1247,12 @@ def main():
                     # 不管基座——这台机器人是轮式浮动基座，每段手臂运动都把整车推挪约 12mm，
                     # 四段累积下来第 4 段的相机视角偏得最远（实测黄色单独跑 87mm，作为第 4 段 163mm）。
                     # 这里把基座与轮子也复位，让"独立开始"真正成立。
-                    if args.verify_ready and globals().get("_SEG1_STATE") is not None:
+                    if args.restore_seg1 and globals().get("_SEG1_Q"):
+                        _restore_seg1(env, globals()["_SEG1_Q"])
+                        _st_r = storage.build_state(storage.obs_callback(env))
+                        _ready_apply = action_dict_for_apply(parse_policy_action(_st_r))
+                        device.set_target(**_ready_apply)
+                    elif args.verify_ready and globals().get("_SEG1_STATE") is not None:
                         _st_v = _verify_ready(manager, env, device, storage,
                                               globals()["_SEG1_STATE"],
                                               globals().get("_BASE_SNAP") or {}, args)
@@ -1204,8 +1262,46 @@ def main():
                         storage.build_state(storage.obs_callback(env)))))
                 if _si == 0:
                     globals()["_SEG1_STATE"] = storage.build_state(storage.obs_callback(env)).copy()
+                    globals()["_SEG1_Q"] = _snap_all_q(env)
+                elif args.seg_diag and globals().get("_SEG1_Q"):
+                    _q_now = _snap_all_q(env)
+                    _q1 = globals()["_SEG1_Q"]
+                    _rows = []
+                    for _n, _va in _q1.items():
+                        _vb = _q_now.get(_n)
+                        if _vb is None or _vb.shape != _va.shape or _va.size == 0:
+                            continue
+                        _rows.append((float(np.max(np.abs(_vb - _va))), _n))
+                    _rows.sort(reverse=True)
+                    _st_now = storage.build_state(storage.obs_callback(env))
+                    _d = float(np.linalg.norm(_st_now[7:10] - globals()["_SEG1_STATE"][7:10])) * 1000
+                    orca_logger.info(
+                        f"[段诊断] 第 {_si + 1} 段起点 vs 第 1 段: 右手 ee 差 {_d:.1f}mm; "
+                        + "; ".join(f"{_n.replace('g1_omnipicker_', '')}={np.degrees(_dv):.2f}deg"
+                                    for _dv, _n in _rows[:5]))
                 orca_logger.info(f"=== 指令 {_si + 1}/{len(_prompts)}: {_p} ===")
+                # 步骤时间窗口。交付脚本默认不调用 begin_step/end_step，评分服务会在
+                # finish 时「自动回溯帧判定所有步骤」：每色的最佳帧在整个 attempt 内搜索，
+                # 实测官方分 31~33，四步标注「完成但异常」。按段圈定窗口后每色只能在
+                # 自己那段取分，实测 22.7。默认沿用交付脚本行为，--scorer_steps 启用圈定。
+                _sc_step = None
+                if args.scorer_steps and scorer is not None and _attempt_active and _st:
+                    _sc_step = f"press_{_st[0]}_button"
+                    try:
+                        scorer.begin_step(_sc_step)
+                        scorer.set_extra("target_color", _st[0])
+                        orca_logger.info(f"[scorer] step begin: {_sc_step}")
+                    except Exception as _e:
+                        orca_logger.warning(f"[scorer] begin_step 失败: {_e}")
+                        _sc_step = None
                 run_segment(_p, _st, args.max_steps)
+                if _sc_step is not None:
+                    try:
+                        _r = scorer.end_step()
+                        orca_logger.info(f"[scorer] step end: {_sc_step} -> {_r.get('success')} "
+                                         f"score={_r.get('score')}")
+                    except Exception as _e:
+                        orca_logger.warning(f"[scorer] end_step 失败: {_e}")
 
             if _interrupt.is_set():
                 truncated = True
