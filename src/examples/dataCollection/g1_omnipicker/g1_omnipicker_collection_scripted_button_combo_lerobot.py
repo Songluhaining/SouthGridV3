@@ -189,6 +189,20 @@ def _quat_mul_xyzw(q1, q2):
     ])
 
 
+def _spin_quat_about_x(q_xyzw, deg: float):
+    """把姿态绕 B 系 x 轴（接近方向）自旋 deg 度，返回 xyzw。"""
+    h = math.radians(deg) / 2.0
+    s, c = math.sin(h), math.cos(h)
+    x1, y1, z1, w1 = float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2]), float(q_xyzw[3])
+    # q_spin = (s, 0, 0, c) 左乘（在 B 系里绕 x 转）
+    return [
+        c * x1 + s * w1,
+        c * y1 - s * z1,
+        c * z1 + s * y1,
+        c * w1 - s * x1,
+    ]
+
+
 def _jitter_quat_xyzw(q, rng: random.Random, max_deg: float):
     ang = math.radians(min(abs(rng.gauss(0.0, max_deg / 2)), max_deg))
     axis = np.array([rng.gauss(0, 1) for _ in range(3)])
@@ -300,6 +314,15 @@ def apply_mode_defaults(args):
     最坏间隔仍有 8s 以上，四钮跨度约 24～28s。
     """
     args._contact_dy, args._contact_dz = (float(x) for x in args.contact_offset.split(","))
+    args._wrist_spin = {}
+    _ws = (args.wrist_spin_deg or "").strip()
+    if _ws:
+        if "=" in _ws:
+            for _kv in _ws.split(","):
+                _k, _, _v = _kv.partition("=")
+                args._wrist_spin[_k.strip()] = float(_v)
+        else:
+            args._wrist_spin["*"] = float(_ws)
     if args.press_depth is None:
         # official：瞄准点即目标，不再压入（压入不加分，只会把基座推离电柜）
         args.press_depth = {"proximity": 0.010, "press": 0.040}.get(args.success_mode, 0.0)
@@ -325,6 +348,8 @@ LEFT_GRIP_HOLD = float(agent_conf.gripper_l["init_ctrl"][0])
 
 # 左臂锁定增益。纯 PD 压不住这条臂（实测 kp=150 漂 18.3°，kp=800 反而 37.4°，
 # 因为力矩已撞驱动器限幅），故改用 hard_lock 运动学锁定，PD 只保留重力前馈。
+_BLOCKER_DIAG = os.environ.get("BLOCKER_DIAG") == "1"
+
 LEFT_LOCK_KP = 150.0
 LEFT_LOCK_KD = 10.0
 
@@ -399,6 +424,13 @@ def build_combo_segments(
         btn = buttons[color]
         cand_idx = rng.randrange(len(btn["candidates"]))
         r_quat = list(btn["candidates"][cand_idx]["r_quat_b"])
+        _spin = args._wrist_spin.get(color, args._wrist_spin.get("*", 0.0))
+        if _spin:
+            # 绕接近轴（B 系 x）自旋：不改变 ee_center_site_r 要去的位置，只改变
+            # 张开时两指落在按钮的哪一侧。实测四色候选姿态的 yaw 差别很大
+            # （红 20.8°、绿 18.9° vs 蓝 8.3°、黄 3.6°），yaw 大的两色张开后
+            # 有一根手指正好戳在帽面上，把官方距离重新钉死。
+            r_quat = list(_spin_quat_about_x(r_quat, _spin))
         cap = np.asarray(cap_provider(color), dtype=np.float64)  # 实时帽心（B 系）
 
         div = bins.pick(rng)
@@ -687,6 +719,24 @@ class MonitoredTrajectoryDevice(AbstractDevice):
                         rec_i["inplane_at_min"] = float(np.linalg.norm(off[1:]))
                     # 复刻评分服务的最佳帧回溯：逐帧按得分曲线取比率最高的一帧，
                     # 并在该帧上做 P1 自检（目标按钮必须是离末端最近的按钮）。
+                    if _BLOCKER_DIAG:
+                        # 停住那一刻机器人到底碰到了什么：扫 MuJoCo 的活动接触对，
+                        # 找出含机器人 geom 的接触，记下对面那个 geom 的名字。
+                        _rg = set(robot_geoms)
+                        for _ci in range(int(d.ncon)):
+                            _c = d.contact[_ci]
+                            _g1, _g2 = int(_c.geom1), int(_c.geom2)
+                            _other = _g2 if _g1 in _rg else (_g1 if _g2 in _rg else None)
+                            if _other is None:
+                                continue
+                            _mine = _g1 if _g1 in _rg else _g2
+                            _n1 = mujoco.mj_id2name(ctx.model, mujoco.mjtObj.mjOBJ_GEOM, _mine) or f"geom{_mine}"
+                            _b1 = mujoco.mj_id2name(ctx.model, mujoco.mjtObj.mjOBJ_BODY,
+                                                    int(ctx.model.geom_bodyid[_mine])) or "?"
+                            _n2 = mujoco.mj_id2name(ctx.model, mujoco.mjtObj.mjOBJ_GEOM, _other) or f"geom{_other}"
+                            _b2 = mujoco.mj_id2name(ctx.model, mujoco.mjtObj.mjOBJ_BODY,
+                                                    int(ctx.model.geom_bodyid[_other])) or "?"
+                            rec_i.setdefault("contacts", {})[f"{_b1}/{_n1} <-> {_b2}/{_n2}"] = round(sd, 4)
                     ratio = official_ratio(sd)
                     if ratio > rec_i["best_ratio"]:
                         rec_i["best_ratio"] = ratio
@@ -781,6 +831,12 @@ def main() -> None:
                         help="前推目标越过瞄准点的深度(米)。默认：proximity 模式 0.010，press 模式 0.040")
     parser.add_argument("--max_consec_fail", type=int, default=3,
                         help="连续多少集按压全败即停止（场景漂移信号：按压反作用力会累计推远基座与电柜，需重启仿真）")
+    parser.add_argument("--wrist_spin_deg", type=str, default="",
+                        help="接近姿态绕接近轴自旋的角度（度）。只改变张开时两指落在按钮"
+                             "哪一侧，不改变末端要去的位置。配合 --grip_r_approach 使用。"
+                             "可给单个数值（四色同值），或逐色 'red=15,green=-15'，"
+                             "未列出的色用 0。实测四色需要的值不同：全局 -15 能修好绿色"
+                             "却让红色更糟。")
     parser.add_argument("--grip_r_approach", type=float, default=None,
                         help="接近/按压全程右爪的开合值（执行器量纲，-1.0 全开 ~ 2.0 全闭）。"
                              "默认 None = 沿用候选位姿里的闭合值。张开后两指分居按钮帽两侧，"
@@ -1236,6 +1292,8 @@ def main() -> None:
                         "aim_err_m": (round(obs_rec["min_aim_dist"], 4)
                                       if obs_rec.get("min_aim_dist") not in (None, float("inf"))
                                       else None),
+                        "contacts": (sorted(obs_rec.get("contacts", {}).items())
+                                     if obs_rec.get("contacts") else None),
                         "p1_ok": p1_ok,
                         "nearest_at_best": obs_rec.get("best_nearest"),
                         "success": bool(success),
