@@ -16,6 +16,8 @@ from controllers.controller_wheel_drive import (
 )
 from devices.abstract_device import AbstractDevice, PicoJoystickDevice
 from devices.data_device import DataDevice
+import os
+
 import numpy as np
 
 
@@ -164,6 +166,15 @@ def create_arm_osc_controller(
     osc_config["policy_freq"] = 1.0 / env.dt
     osc_config["ndim"] = len(arm_joint_names)
     osc_config["control_delta"] = False
+    # 末端阻抗刚度。停住的位置是力平衡点而非几何硬墙：接触后 kp 越大压得越进去，
+    # 官方距离随之变小。配置默认 150、上限 300。
+    # 【必须采集与评测取同一个值】——action 记的是下达指令，指令在不同刚度下
+    # 压出的深度不同，两侧不一致会让模型学到的量在评测时对不上。
+    _kp = os.environ.get("G1_OSC_KP")
+    if _kp:
+        lo, hi = osc_config.get("kp_limits", [0, 300])
+        osc_config["kp"] = float(np.clip(float(_kp), lo, hi))
+        print(f"[OSC] kp = {osc_config['kp']}（默认 {150}，来自环境变量 G1_OSC_KP）", flush=True)
 
     controller = controller_factory(osc_config["type"], osc_config)
 

@@ -907,12 +907,13 @@ class LeRobotSimSyncMixin:
             wall_t = time.perf_counter()
             if self._lr_ep_start_wall is None:
                 self._lr_ep_start_wall = wall_t
-            self._lr_states.append((state_cur, wall_t))
+            self._lr_states.append((state_cur, wall_t, self._capture_cmd()))
             self._lr_count += 1
             self._lr_next_cap += 1.0 / self._lr_fps
             return
 
         state_cur = self.build_state(obs)
+        cmd_cur = self._capture_cmd()
         _cam_t0 = time.perf_counter()
         images_cur, cam_indices_cur = capture_frame_with_idx(
             self._lr_cameras, self._lr_camera_map, self._lr_target_hw
@@ -922,11 +923,11 @@ class LeRobotSimSyncMixin:
             _log.warning(f"[CAM_CAPTURE] 相机帧捕获阻塞: {_cam_ms:.1f}ms")
 
         if self._lr_prev is not None:
-            state_prev, images_prev, _ = self._lr_prev
+            state_prev, images_prev, _, cmd_prev = self._lr_prev
             cams = camera_keys(self._lr_camera_map)
             frame: dict = {
                 "observation.state": state_prev.astype(np.float32),
-                "action": self.build_action(state_prev, state_cur).astype(np.float32),
+                "action": self._action_with_cmd(state_prev, state_cur, cmd_prev).astype(np.float32),
             }
             for cam_key in cams:
                 frame[f"observation.images.{cam_key}"] = images_prev[cam_key]
@@ -935,9 +936,41 @@ class LeRobotSimSyncMixin:
             if self._lr_cam_start_idx is None:
                 self._lr_cam_start_idx = dict(cam_indices_cur)
 
-        self._lr_prev = (state_cur, images_cur, cam_indices_cur)
+        self._lr_prev = (state_cur, images_cur, cam_indices_cur, cmd_cur)
         self._lr_count += 1
         self._lr_next_cap += 1.0 / self._lr_fps
+
+    def set_cmd_provider(self, fn) -> None:
+        """注册指令提供者：返回当前帧下达给右臂的 (pos3, quat_xyzw4)，base 系；无则 None。
+
+        数据集里 action 默认记「下一帧实际到达的位姿」。但末端是阻抗控制，接触时
+        停在力平衡点——示范的到达位姿是用更深的指令压出来的。模型若学「命令到达
+        位姿」，执行时压力不足，必然停在更外面（实测欠冲约 6mm）。
+        注册本回调后 action 的右臂 7 个通道改记当时真正下达的指令，
+        左臂与夹爪通道不变（左臂锁定为常数，夹爪本来记的就是 ctrl 指令）。
+        """
+        self._lr_cmd_provider = fn
+
+    def _capture_cmd(self):
+        fn = getattr(self, "_lr_cmd_provider", None)
+        if fn is None:
+            return None
+        try:
+            c = fn()
+        except Exception:
+            return None
+        if c is None:
+            return None
+        c = np.asarray(c, dtype=np.float32).ravel()
+        return c if c.size == 7 else None
+
+    def _action_with_cmd(self, state_prev, state_cur, cmd):
+        a = np.asarray(self.build_action(state_prev, state_cur), dtype=np.float32)
+        if cmd is None or a.size < 14:
+            return a
+        a = a.copy()
+        a[7:14] = cmd
+        return a
 
     def save_data(self, episode_video_dir: str | None = None, ep_start_wall: float | None = None, **kwargs) -> None:
         """提交本集数据到后台 worker（不阻塞主线程）。"""
@@ -975,8 +1008,9 @@ class LeRobotSimSyncMixin:
             self._reset_episode()
             return
 
-        states = [s for s, _ in self._lr_states]
-        wall_ts = [t for _, t in self._lr_states]
+        states = [r[0] for r in self._lr_states]
+        wall_ts = [r[1] for r in self._lr_states]
+        cmds = [(r[2] if len(r) > 2 else None) for r in self._lr_states]
         ep_start = ep_start_wall if ep_start_wall is not None else (
             self._lr_ep_start_wall if self._lr_ep_start_wall is not None else wall_ts[0]
         )
@@ -991,7 +1025,7 @@ class LeRobotSimSyncMixin:
                 break
             frame: dict = {
                 "observation.state": states[i].astype(np.float32),
-                "action": self.build_action(states[i], states[i + 1]).astype(np.float32),
+                "action": self._action_with_cmd(states[i], states[i + 1], cmds[i]).astype(np.float32),
             }
             for cam_key in cams:
                 frame[f"observation.images.{cam_key}"] = images[cam_key]
@@ -1029,7 +1063,7 @@ class LeRobotSimSyncMixin:
     def _log_cam_alignment(self) -> None:
         if not self._lr_cameras or self._lr_cam_start_idx is None or self._lr_prev is None:
             return
-        _, _, cam_end_idx = self._lr_prev
+        _, _, cam_end_idx = self._lr_prev[:3]
         written = self._lr_count - 1
         if written <= 0:
             return

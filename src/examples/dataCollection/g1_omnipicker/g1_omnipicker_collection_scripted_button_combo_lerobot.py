@@ -145,20 +145,21 @@ def make_task_phrase(colors: list[str], rng: random.Random, canonical_ratio: flo
 # 组合序列均衡采样：长度 1..max 的全部有序不重复颜色序列，取当前覆盖数最少者
 # ---------------------------------------------------------------------------
 
-def all_sequences(max_buttons: int) -> list[tuple[str, ...]]:
+def all_sequences(max_buttons: int, only: tuple[str, ...] | None = None) -> list[tuple[str, ...]]:
     seqs = []
     for n in range(1, max_buttons + 1):
-        seqs.extend(itertools.permutations(_COLOR_ORDER, n))
+        seqs.extend(itertools.permutations(only or _COLOR_ORDER, n))
     return seqs
 
 
 class SequenceSampler:
-    def __init__(self, max_buttons: int, length_weights: list[float], rng: random.Random):
+    def __init__(self, max_buttons: int, length_weights: list[float], rng: random.Random,
+                 only: tuple[str, ...] | None = None):
         self.rng = rng
         self.by_len: dict[int, list[tuple[str, ...]]] = {}
-        for s in all_sequences(max_buttons):
+        for s in all_sequences(max_buttons, only):
             self.by_len.setdefault(len(s), []).append(s)
-        self.counts: dict[tuple[str, ...], int] = {s: 0 for s in all_sequences(max_buttons)}
+        self.counts: dict[tuple[str, ...], int] = {s: 0 for s in all_sequences(max_buttons, only)}
         self.lengths = sorted(self.by_len.keys())
         w = [max(0.0, length_weights[n - 1]) for n in self.lengths]
         total = sum(w) or 1.0
@@ -187,6 +188,26 @@ def _quat_mul_xyzw(q1, q2):
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
         w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
     ])
+
+
+def _rot_quat_about_axis(q_xyzw, axis: str, deg: float):
+    """把姿态绕 B 系的指定轴再转 deg 度（左乘），返回 xyzw。
+
+    x 轴 = 接近方向（只改两指落在按钮哪一侧）；
+    y / z 轴 = 把夹爪轴线整体转离接近方向 —— 这决定「最先碰到面板的是哪个部位」，
+    进而决定评分点 ee_center_site_r 能贴多近。指尖正面朝向面板时它被挡在 63mm 外。
+    """
+    h = math.radians(deg) / 2.0
+    sn, cs = math.sin(h), math.cos(h)
+    ax = {"x": (sn, 0.0, 0.0), "y": (0.0, sn, 0.0), "z": (0.0, 0.0, sn)}[axis]
+    x2, y2, z2, w2 = ax[0], ax[1], ax[2], cs
+    x1, y1, z1, w1 = (float(v) for v in q_xyzw)
+    return [
+        w2 * x1 + x2 * w1 + y2 * z1 - z2 * y1,
+        w2 * y1 - x2 * z1 + y2 * w1 + z2 * x1,
+        w2 * z1 + x2 * y1 - y2 * x1 + z2 * w1,
+        w2 * w1 - x2 * x1 - y2 * y1 - z2 * z1,
+    ]
 
 
 def _spin_quat_about_x(q_xyzw, deg: float):
@@ -314,6 +335,11 @@ def apply_mode_defaults(args):
     最坏间隔仍有 8s 以上，四钮跨度约 24～28s。
     """
     args._contact_dy, args._contact_dz = (float(x) for x in args.contact_offset.split(","))
+    args._wrist_rot = []
+    for _kv in (args.wrist_rot or "").split(","):
+        _k, _, _v = _kv.partition("=")
+        if _k.strip() in ("x", "y", "z") and _v.strip():
+            args._wrist_rot.append((_k.strip(), float(_v)))
     args._wrist_spin = {}
     _ws = (args.wrist_spin_deg or "").strip()
     if _ws:
@@ -424,6 +450,8 @@ def build_combo_segments(
         btn = buttons[color]
         cand_idx = rng.randrange(len(btn["candidates"]))
         r_quat = list(btn["candidates"][cand_idx]["r_quat_b"])
+        for _ax, _dg in args._wrist_rot:
+            r_quat = list(_rot_quat_about_axis(r_quat, _ax, _dg))
         _spin = args._wrist_spin.get(color, args._wrist_spin.get("*", 0.0))
         if _spin:
             # 绕接近轴（B 系 x）自旋：不改变 ee_center_site_r 要去的位置，只改变
@@ -630,6 +658,19 @@ class MonitoredTrajectoryDevice(AbstractDevice):
             if w["t0"] - 5 <= self.t <= w["t1"] + 10:
                 yield i
 
+    def current_cmd7(self):
+        """当前观测下「接下来要下达」的右臂指令 (pos3, quat_xyzw4)，base 系。
+
+        update() 在末尾才 self.t += 1，而观测回调在 env.step() 之后触发，
+        所以此刻 self.t 指向的正是下一步将要下达的目标——这正是策略在该观测下
+        应当输出的量。供 storage.set_cmd_provider 记进 action。
+        """
+        t = min(int(self.t), len(self.r_pos) - 1)
+        return np.concatenate([
+            np.asarray(self.r_pos[t], dtype=np.float32).ravel(),
+            np.asarray(self.r_quat[t], dtype=np.float32).ravel(),
+        ])
+
     def update(self):
         if self.t >= len(self.r_pos):
             return
@@ -831,6 +872,18 @@ def main() -> None:
                         help="前推目标越过瞄准点的深度(米)。默认：proximity 模式 0.010，press 模式 0.040")
     parser.add_argument("--max_consec_fail", type=int, default=3,
                         help="连续多少集按压全败即停止（场景漂移信号：按压反作用力会累计推远基座与电柜，需重启仿真）")
+    parser.add_argument("--wrist_rot", type=str, default="",
+                        help="接近姿态绕 B 系轴的附加旋转，如 'y=60' 或 'y=60,z=-20'。"
+                             "x 轴等同 --wrist_spin_deg；y/z 会把夹爪轴线转离接近方向，"
+                             "从而改变最先碰到面板的部位——这决定 ee_center_site_r 能贴多近。")
+    parser.add_argument("--action_from_cmd", action="store_true",
+                        help="action 的右臂通道改记「当时下达给力控的指令」，而不是「下一帧实际"
+                             "到达的位姿」。末端是阻抗控制，接触时停在力平衡点，示范的到达位姿"
+                             "是用更深的指令压出来的；模型若学到达位姿，执行时压力不足会停在"
+                             "更外面（实测欠冲约 6mm）。state 仍然是实测值，不受影响。")
+    parser.add_argument("--only_colors", type=str, default="",
+                        help="只采这些颜色（逗号分隔，如 red 或 red,green）。用于逐色标定接近姿态，"
+                             "省去为了凑到某一色而采其它三色的时间。默认空 = 四色都采。")
     parser.add_argument("--wrist_spin_deg", type=str, default="",
                         help="接近姿态绕接近轴自旋的角度（度）。只改变张开时两指落在按钮"
                              "哪一侧，不改变末端要去的位置。配合 --grip_r_approach 使用。"
@@ -884,7 +937,10 @@ def main() -> None:
     approach_back = float(cand_spec.get("approach_back", 0.12))
     buttons: dict = cand_spec["buttons"]
 
-    sampler = SequenceSampler(args.max_buttons, length_weights, rng)
+    _only = tuple(c.strip() for c in args.only_colors.split(",") if c.strip()) or None
+    if _only:
+        orca_logger.info(f"[采集] 只采指定颜色: {list(_only)}")
+    sampler = SequenceSampler(args.max_buttons, length_weights, rng, only=_only)
     bins = DiversityBins()
 
     traj_archive = None
@@ -1204,6 +1260,8 @@ def main() -> None:
                     pre_roll=pre_roll,
                     lock_joints=[env.joint(j) for j in agent_conf.gripper_l["joint_names"]])
                 manager.set_device(device)
+                if args.action_from_cmd:
+                    storage.set_cmd_provider(device.current_cmd7)
                 # 防御：位标志会被任何 model 重载冲掉（竞态随机出现），每集强制重设并验证。
                 # position 伺服组若复活会与 OSC 力矩对抗，手速降 ~10 倍停在力平衡点。
                 env.disable_actuator([agent_conf.positions_group])
